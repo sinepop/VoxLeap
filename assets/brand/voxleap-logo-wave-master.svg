@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1254" height="1254" viewBox="0 0 1254 1254" role="img" aria-labelledby="title desc">
+  <title id="title">VoxLeap waveform mark</title>
+  <desc id="desc">Five solid blue and cyan forward-leaning blocks forming a compact wave rhythm.</desc>
+  <g id="voxleap-mark" shape-rendering="geometricPrecision">
+    <polygon fill="#00E2F1" points="360,593 439,593 416,700 337,700"/>
+    <polygon fill="#0046F1" points="499,491 579,491 528,728 449,728"/>
+    <polygon fill="#0046F1" points="631,437 710,437 627,819 547,819"/>
+    <polygon fill="#00E2F1" points="704,659 781,659 752,780 675,780"/>
+    <polygon fill="#0046F1" points="836,594 914,594 886,715 809,715"/>
+  </g>
+</svg>

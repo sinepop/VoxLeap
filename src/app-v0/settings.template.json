@@ -1,0 +1,15 @@
+{
+  "baseUrl": "https://api.stepfun.com/step_plan/v1",
+  "endpoint": "/audio/asr/sse",
+  "api": "sse",
+  "model": "stepaudio-2.5-asr",
+  "apiKeyProtected": "",
+  "autoInsert": false,
+  "language": "zh",
+  "hotkey": "RControl",
+  "hotkeyMode": "hold",
+  "hotwords": "",
+  "clipboardThreshold": 200,
+  "requestTimeoutMs": 20000,
+  "maxRecordMs": 300000
+}

@@ -1,0 +1,21 @@
+{
+  "name": "voxleap-logo-wave-master",
+  "source": "voxleap-logo-wave-v11-rhythm-refined.png",
+  "viewBox": "0 0 1254 1254",
+  "exports": [
+    {
+      "file": "voxleap-logo-wave-master.svg",
+      "background": "transparent"
+    },
+    {
+      "file": "voxleap-logo-wave-master-navy.svg",
+      "background": "#03122E"
+    }
+  ],
+  "fills": {
+    "blue": "#0046F1",
+    "cyan": "#00E2F1"
+  },
+  "effects": "none",
+  "geometry": "five fixed forward-leaning polygon blocks"
+}

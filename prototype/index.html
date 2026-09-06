@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="description" content="声跃 VoxLeap Windows 语音输入交互原型">
+  <title>声跃 VoxLeap · 桌面输入交互原型</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="refinement-v4.css">
+</head>
+<body>
+  <div class="wallpaper" aria-hidden="true">
+    <i class="aurora-field aurora-mint"></i>
+    <i class="aurora-field aurora-lilac"></i>
+    <i class="aurora-field aurora-champagne"></i>
+    <i class="aurora-field aurora-aqua"></i>
+    <span class="grain"></span>
+  </div>
+
+  <header class="prototype-bar">
+    <div class="mini-brand">
+      <svg class="pulse-block-mark brand-logo official-mark" viewBox="317 417 617 422" shape-rendering="geometricPrecision" aria-hidden="true">
+        <g class="leap-blocks">
+          <polygon class="leap-block leap-one" fill="#00E2F1" points="360,593 439,593 416,700 337,700"/>
+          <polygon class="leap-block leap-two" fill="#0046F1" points="499,491 579,491 528,728 449,728"/>
+          <polygon class="leap-block leap-three" fill="#0046F1" points="631,437 710,437 627,819 547,819"/>
+          <polygon class="leap-block leap-four" fill="#00E2F1" points="704,659 781,659 752,780 675,780"/>
+          <polygon class="leap-block leap-five" fill="#0046F1" points="836,594 914,594 886,715 809,715"/>
+        </g>
+      </svg>
+      <div><strong>声跃</strong><span>VoxLeap</span></div>
+    </div>
+    <div class="prototype-kind">
+      <i></i>
+      Windows 桌面输入交互原型
+    </div>
+    <button class="motion-control" id="motionToggle" type="button" aria-pressed="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 13c3.2-7 5.8-7 8 0s4.8 7 8 0"/></svg>
+      <span>动态效果</span>
+    </button>
+  </header>
+
+  <main class="desktop-stage">
+    <section class="document-window" aria-label="模拟的桌面文档应用">
+      <header class="window-chrome">
+        <div class="traffic-lights" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div class="document-name">灵感草稿</div>
+        <button class="quiet-button" id="clearTarget" type="button">清空</button>
+      </header>
+
+      <div class="paper">
+        <div class="paper-meta">
+          <span>产品随记</span>
+          <time>刚刚</time>
+        </div>
+        <h1>让表达跟上思考</h1>
+        <p class="lead">不必打开一个新的 AI 工具，只要在正在输入的地方按住一个键，说完、看一眼，然后继续工作。</p>
+        <div class="soft-rule" aria-hidden="true"></div>
+        <label for="targetInput">继续写下去</label>
+        <div class="writing-area">
+          <textarea id="targetInput" spellcheck="false" placeholder="把光标留在这里，然后按住右 Ctrl……"></textarea>
+          <span class="writing-glow" aria-hidden="true"></span>
+        </div>
+        <footer class="paper-footer">
+          <span id="characterCount">0 字</span>
+          <span>本地演示文稿</span>
+        </footer>
+      </div>
+    </section>
+
+    <aside class="demo-guide" id="demoGuide">
+      <p class="guide-eyebrow">这不是网页产品</p>
+      <h2>最终形态是 Windows<br>常驻语音输入工具</h2>
+      <p class="guide-copy">平时完全隐藏。需要输入时，按住一个键，声纹才会从屏幕底部浮现。</p>
+      <button class="hold-demo" id="mouseHold" type="button">
+        <span class="ctrl-key">右 Ctrl</span>
+        <span class="hold-copy"><strong>按住说话</strong><small>正式版可自由改键</small></span>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+      </button>
+      <p class="simulation-note"><i></i>当前使用模拟字幕，不会请求麦克风权限</p>
+    </aside>
+  </main>
+
+  <section class="voice-layer" id="voiceLayer" data-state="idle" aria-label="实时语音输入浮层" aria-hidden="true" inert>
+    <div class="live-transcript">
+      <span class="transcript-state" id="transcriptState">正在听</span>
+      <p id="liveCaption" aria-live="polite"></p>
+    </div>
+
+    <div class="voice-glass">
+      <button class="round-action cancel-recording" id="cancelRecording" type="button" aria-label="取消本次录音">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 8 8 8m0-8-8 8"/></svg>
+      </button>
+
+      <div class="wave-ribbon">
+        <canvas id="waveCanvas" aria-hidden="true"></canvas>
+        <span class="wave-reflection" aria-hidden="true"></span>
+      </div>
+
+      <time id="elapsedTime">00:00</time>
+
+      <div class="release-key">
+        <span>Ctrl</span>
+        <small id="releaseLabel">松开完成</small>
+      </div>
+    </div>
+  </section>
+
+  <section class="review-dock" id="reviewDock" aria-labelledby="reviewTitle" aria-hidden="true" inert>
+    <span class="glass-highlight" aria-hidden="true"></span>
+    <header class="review-header">
+      <div class="review-heading">
+        <span class="review-mark" aria-hidden="true">
+          <svg class="pulse-block-mark official-mark" viewBox="317 417 617 422" shape-rendering="geometricPrecision">
+            <g class="leap-blocks">
+              <polygon class="leap-block leap-one" fill="#00E2F1" points="360,593 439,593 416,700 337,700"/>
+              <polygon class="leap-block leap-two" fill="#0046F1" points="499,491 579,491 528,728 449,728"/>
+              <polygon class="leap-block leap-three" fill="#0046F1" points="631,437 710,437 627,819 547,819"/>
+              <polygon class="leap-block leap-four" fill="#00E2F1" points="704,659 781,659 752,780 675,780"/>
+              <polygon class="leap-block leap-five" fill="#0046F1" points="836,594 914,594 886,715 809,715"/>
+            </g>
+          </svg>
+        </span>
+        <div>
+          <p>写入「灵感草稿」之前</p>
+          <h2 id="reviewTitle">确认文字，再写入</h2>
+        </div>
+      </div>
+      <button class="round-action close-review" id="closeReview" type="button" aria-label="关闭并取消">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 8 8 8m0-8-8 8"/></svg>
+      </button>
+    </header>
+
+    <nav class="tone-switch" aria-label="文字整理方式" role="tablist">
+      <button class="tone active" type="button" role="tab" aria-selected="true" data-mode="original">
+        <strong>原文</strong><small>保留口述</small>
+      </button>
+      <button class="tone" type="button" role="tab" aria-selected="false" data-mode="smooth">
+        <strong>润色</strong><small>去掉口头语</small>
+      </button>
+      <button class="tone" type="button" role="tab" aria-selected="false" data-mode="outline">
+        <strong>提纲</strong><small>整理层次</small>
+      </button>
+    </nav>
+
+    <div class="review-paper">
+      <div class="polish-state" id="polishState" aria-live="polite">
+        <span></span><p id="polishLabel">正在轻度润色…</p>
+      </div>
+      <textarea id="reviewEditor" spellcheck="false" aria-label="插入前可修改的文字"></textarea>
+      <footer>
+        <button class="compare-button" id="compareButton" type="button" aria-expanded="false">对照口述原文</button>
+        <span id="reviewCount">0 字</span>
+      </footer>
+    </div>
+
+    <div class="comparison" id="comparison" hidden>
+      <p><span>口述原文</span><em id="originalText"></em></p>
+      <p><span>当前文字</span><em id="currentText"></em></p>
+    </div>
+
+    <div class="review-meta">
+      <p id="modeNote"><i></i><span id="modeNoteText">保持口述原样，不使用生成式文字整理</span></p>
+      <div class="review-actions">
+        <button class="utility-action" id="rerecordButton" type="button" aria-label="重新录制">
+          <span class="action-glyph">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="10" y="4" width="4" height="8" rx="2"/>
+              <path d="M7.5 10a4.5 4.5 0 0 0 9 0M12 14.5V18M8.5 18h7M5 8V4m0 0h4M5 4a9 9 0 0 1 14 4"/>
+            </svg>
+          </span>
+          <span class="action-label"><strong>重新录制</strong><small>再说一遍</small></span>
+        </button>
+        <button class="utility-action" id="copyButton" type="button" aria-label="复制文字">
+          <span class="action-glyph">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="8" y="8" width="11" height="11" rx="2.5"/>
+              <path d="M16 8V6.5A2.5 2.5 0 0 0 13.5 4h-7A2.5 2.5 0 0 0 4 6.5v7A2.5 2.5 0 0 0 6.5 16H8"/>
+            </svg>
+          </span>
+          <span class="action-label"><strong>复制文字</strong><small>保留到剪贴板</small></span>
+        </button>
+        <button class="write-action" id="insertButton" type="button" aria-label="写入光标处">
+          <span class="action-glyph write-glyph">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3.5 12h10m-4-4 4 4-4 4M18 4v16m-2-16h4m-4 16h4"/>
+            </svg>
+          </span>
+          <span class="action-label"><strong>写入光标处</strong><small>不会自动发送</small></span>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <div class="toast" id="toast" role="status" aria-live="polite">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m7 12 3 3 7-7"/></svg>
+    <span id="toastText">已写入光标处</span>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

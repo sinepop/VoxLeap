@@ -1,0 +1,21 @@
+# Local credentials and runtime data
+settings.json
+.env
+.env.*
+!.env.example
+*.log
+*.wav
+*.mp3
+*.m4a
+
+# Local build and editor output
+bin/
+obj/
+*.pdb
+*.user
+*.suo
+*.bak
+
+# Python/test caches
+__pycache__/
+*.py[cod]
