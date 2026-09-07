@@ -1457,7 +1457,14 @@ namespace VoxLeap
         private float _visualLevel;
         private bool _recording;
         public int MaxRecordMs = 0; // 0=不限制；来自配置 maxRecordMs
+        // 对抗审查 P1 安全闸：即使 MaxRecordMs=0，录音也不得无限持续（keyup 丢失/卡住场景）。
+        // 10 分钟硬顶后自动转入转写（MaxDurationReached），避免麦克风静默常开。
+        private static readonly int RecordSafeguardMs = 10 * 60 * 1000;
         public Action MaxDurationReached; // 录音到上限时的回调（由宿主定义为转存并继续转写）
+        // 对抗审查 P1 键态探测：宿主注入“热键物理上是否仍按住”，用于 keyup 丢失（Alt+Tab/UAC/安全桌面/ RDP）自动收尾。
+        public Func<bool> HoldKeyStillDown;
+        private DateTime _holdKeyLiftedAt = DateTime.MinValue;
+        private bool _holdKeyWasDownOnce;
         private static readonly int[] WaveLags = new[] { 3, 1, 0, 2, 4 };
         private static readonly float[] WaveGains = new[] { 0.72f, 0.92f, 1.0f, 0.86f, 0.66f };
 
@@ -1513,6 +1520,8 @@ namespace VoxLeap
         {
             _startedAt = DateTime.Now;
             _recording = true;
+            _holdKeyWasDownOnce = true; // 录音开始即认为热键处于按下态，供 keyup 丢失检测
+            _holdKeyLiftedAt = DateTime.MinValue;
             _busyCaption = "";
             _busy = false;
             _busyTarget = targetWindow;
@@ -1554,6 +1563,8 @@ namespace VoxLeap
             _timer.Stop();
             _levelTimer.Stop();
             _recording = false;
+            _holdKeyWasDownOnce = false; // keyup 检测状态复位，防止下次录音误触发
+            _holdKeyLiftedAt = DateTime.MinValue;
             _busy = false;
             ResetWave();
             HideLayeredAnimated(260); // 渐消 + 向下沉
@@ -1588,10 +1599,29 @@ namespace VoxLeap
         {
             // 时间码秒级（00:07）；100ms 刷新保证秒位切换即时。承担录音上限守护。
             int totalSeconds = Math.Max(0, (int)(DateTime.Now - _startedAt).TotalSeconds);
-            if (_recording && MaxRecordMs > 0 && totalSeconds * 1000L >= MaxRecordMs)
+            if (_recording)
             {
-                _recording = false; // 防重入
-                if (MaxDurationReached != null) MaxDurationReached();
+                // cap: MaxRecordMs>0 用配置值；0 时也走 10 分钟安全闸，避免 keyup 丢失时无限录音。
+                long capMs = MaxRecordMs > 0 ? MaxRecordMs : RecordSafeguardMs;
+                if (totalSeconds * 1000L >= capMs)
+                {
+                    _recording = false; // 防重入
+                    if (MaxDurationReached != null) MaxDurationReached();
+                }
+                else if (HoldKeyStillDown != null && _holdKeyWasDownOnce)
+                {
+                    // keyup 丢失检测：录音中探测到热键已物理离开（持续 >=500ms 非 down），
+                    // 判定 keyup 事件丢失（Alt+Tab/UAC 弹窗/安全桌面/RDP），自动收尾转写。
+                    bool down = HoldKeyStillDown();
+                    if (down) _holdKeyLiftedAt = DateTime.MinValue;
+                    else if (_holdKeyLiftedAt == DateTime.MinValue) _holdKeyLiftedAt = DateTime.Now;
+                    else if ((DateTime.Now - _holdKeyLiftedAt).TotalMilliseconds >= 500)
+                    {
+                        _recording = false;
+                        _holdKeyLiftedAt = DateTime.MinValue;
+                        if (MaxDurationReached != null) MaxDurationReached();
+                    }
+                }
             }
             _elapsedText = (totalSeconds / 60).ToString("00") + ":" + (totalSeconds % 60).ToString("00");
             if (IsHandleCreated && Visible) RefreshLayeredSurface();
@@ -2178,16 +2208,30 @@ namespace VoxLeap
         private State _state = State.Idle;
         private DateTime _recordStart;
         private IntPtr _target = IntPtr.Zero;
+        private uint _targetPid; // 录音开始时的目标进程 ID，注入前复核句柄是否被复用（P1：窗口身份校验）
         private bool _hotkeyWasDown;
         private AsrSession _asrSession;
         private System.Windows.Forms.Timer _cancelWatchdog;
+        private DateTime _suppressHotkeyUntil; // 自动收尾（超时/keyup 丢失）后短暂抑制热键自动重复触发
 
         public TrayContext(bool openSettingsOnStart)
         {
             _cfg = Config.Load();
             _overlay = new OverlayForm();
             _overlay.MaxRecordMs = _cfg.MaxRecordMs;
-            _overlay.MaxDurationReached = delegate { OnHoldRelease(); };
+            _overlay.MaxDurationReached = delegate
+            {
+                // 自动收尾（录音上限/keyup 丢失兜底）后热键若仍被按住，auto-repeat 的 keydown
+                // 会在转写完成后误触发新一轮录音；抑制 1 秒，等用户实际松开再按才允许。
+                _suppressHotkeyUntil = DateTime.Now.AddSeconds(1);
+                OnHoldRelease();
+            };
+            // 对抗审查 P1：向浮层注入热键实测探测，keyup 丢失（Alt+Tab/UAC/安全桌面/RDP）时自动收尾；toggle 模式不适用（不依赖按住）。
+            _overlay.HoldKeyStillDown = delegate
+            {
+                if (IsToggleMode(_cfg)) return true; // toggle 模式不探测“抬起”，避免误终止
+                return KeyDown(GetHotkeyVk(_cfg));
+            };
             _toast = new ToastForm();
 
             var menu = new ContextMenuStrip();
@@ -2254,6 +2298,12 @@ namespace VoxLeap
             _configReloadTimer.Start();
 
             Log.Write("启动: model=" + _cfg.Model + " hasKey=" + _cfg.HasKey + " hook=" + (_hook != IntPtr.Zero));
+            if (_hook == IntPtr.Zero)
+            {
+                // 对抗审查 P1：钩子安装失败仅留日志等于热键全盲且无人知晓（安全软件拦截常见）。
+                _toast.ShowToast("全局热键不可用，可能被安全软件拦截；可从托盘右键打开设置");
+                Log.Write("警告: 键盘钩子安装失败，热键功能不可用，需从托盘菜单操作");
+            }
             if (!string.IsNullOrEmpty(_cfg.ParseIssue))
             {
                 _toast.ShowToast("配置需要检查，请打开设置查看");
@@ -2306,6 +2356,8 @@ namespace VoxLeap
                         {
                             if (!_hotkeyWasDown)
                             {
+                                // 自动收尾后的热键抑制期：忽略 auto-repeat 的 keydown，不触发新一轮（审查 P2）。
+                                if (DateTime.Now < _suppressHotkeyUntil) return Native.CallNextHookEx(_hook, nCode, wParam, lParam);
                                 _hotkeyWasDown = true;
                                 if (_state == State.Idle)
                                 {
@@ -2482,6 +2534,8 @@ namespace VoxLeap
                     return;
                 }
                 _target = fg;
+                // 返回值为线程 ID；out 参数才是进程 ID
+                Native.GetWindowThreadProcessId(fg, out _targetPid);
                 _recordStart = DateTime.Now;
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
@@ -2490,6 +2544,10 @@ namespace VoxLeap
             catch (Exception ex)
             {
                 _state = State.Idle;
+                // 对抗审查 P1：Recorder.Start 已成功后若浮层/GDI 抛异常，须停麦并隐藏浮层，
+                // 否则麦克风持续采集但状态已回 Idle（静默常开）。
+                try { Recorder.Stop(); } catch { }
+                try { _overlay.HideOverlay(); } catch { }
                 Log.Write("开始录音失败: " + ex.Message);
             }
         }
@@ -2639,16 +2697,24 @@ namespace VoxLeap
         }
 
         // 原文保底：写入剪贴板后延迟恢复用户原内容；期间被其他程序占用则不恢复。
-        private static void SetClipboardAndRestore(string text)
+        // 对抗审查 P1/P2：多恢复线程交叉覆盖——连续两次注入时，先发线程醒来后可能把剪贴板
+        // 改回旧快照。用静态代次号保证只有最新一次写入的恢复线程能执行恢复。
+        private static int _clipboardGen;
+        private static bool SetClipboardAndRestore(string text)
         {
             string original = null;
             try { original = Clipboard.GetText(); } catch { }
-            try { Clipboard.SetText(text); } catch { }
+            bool written = false;
+            try { Clipboard.SetText(text); written = true; } catch { }
+            int gen = System.Threading.Interlocked.Increment(ref _clipboardGen);
+            if (!written) return false; // 写入失败时返回 false，调用方不得 toast 谎报“已复制”
             Thread t = new Thread(delegate()
             {
                 Thread.Sleep(4000);
                 try
                 {
+                    // 只放行最新代次；旧代次的恢复请求即使醒来也放弃，避免覆盖新内容。
+                    if (gen != System.Threading.Volatile.Read(ref _clipboardGen)) return;
                     if (Clipboard.GetText() == text)
                     {
                         if (!string.IsNullOrEmpty(original)) Clipboard.SetText(original);
@@ -2660,6 +2726,7 @@ namespace VoxLeap
             t.IsBackground = true;
             t.SetApartmentState(ApartmentState.STA);
             t.Start();
+            return true;
         }
 
         private void InjectText(string text)
@@ -2674,33 +2741,67 @@ namespace VoxLeap
                 }
                 if (!Native.IsWindow(target))
                 {
-                    SetClipboardAndRestore(text);
+                    if (!SetClipboardAndRestore(text))
+                    {
+                        _toast.ShowToast("目标窗口已关闭，且剪贴板不可用，未能保底复制");
+                        return;
+                    }
                     _toast.ShowToast("目标窗口已关闭，已复制到剪贴板");
                     return;
+                }
+                // 对抗审查 P1：HWND 是内核复用资源，录音→注入窗口期内原窗口关闭后
+                // 句柄值可能被分配给任意新窗口。仅 IsWindow 无法区分，必须比进程 ID。
+                if (_targetPid != 0)
+                {
+                    uint pidNow;
+                    Native.GetWindowThreadProcessId(target, out pidNow);
+                    if (pidNow != _targetPid)
+                    {
+                        Log.Write("写入拒绝: 目标进程变化 (" + pidNow + " != " + _targetPid + "), 文字入剪贴板 " + text.Length + "字");
+                        if (!SetClipboardAndRestore(text))
+                        {
+                            _toast.ShowToast("目标窗口已消失或更换，且剪贴板不可用，未能保底复制");
+                            return;
+                        }
+                        _toast.ShowToast("目标窗口已消失或更换，已复制到剪贴板");
+                        return;
+                    }
                 }
                 // UIPI：向更高完整性窗口发送输入时系统会静默丢弃（SendInput 仍返回成功数），
                 // 因此注入前直接检测完整性级别，命中则改为剪贴板方案，不依赖返回值判定。
                 if (TargetSafety.IsHigherIntegrity(target))
                 {
-                    SetClipboardAndRestore(text);
-                    _toast.ShowToast("目标窗口需要更高权限，已复制到剪贴板");
                     Log.Write("写入拒绝: 目标完整性高于当前进程, 文字入剪贴板 " + text.Length + "字");
+                    if (!SetClipboardAndRestore(text))
+                    {
+                        _toast.ShowToast("目标窗口需要更高权限，且剪贴板不可用，未能保底复制");
+                        return;
+                    }
+                    _toast.ShowToast("目标窗口需要更高权限，已复制到剪贴板");
                     return;
                 }
                 ForceForeground(target);
                 Thread.Sleep(80);
                 if (Native.GetForegroundWindow() != target)
                 {
-                    SetClipboardAndRestore(text);
+                    if (!SetClipboardAndRestore(text))
+                    {
+                        _toast.ShowToast("无法切回目标窗口，且剪贴板不可用，未能保底复制");
+                        return;
+                    }
                     _toast.ShowToast("无法切回目标窗口，已复制到剪贴板");
                     return;
                 }
                 // 敏感控件二次校验：录音/转写期间焦点控件可能变化，注入前对聚焦控件重查密码样式。
                 if (IsPasswordField(target))
                 {
-                    SetClipboardAndRestore(text);
-                    _toast.ShowToast("检测到密码框，已拒绝写入，内容已复制到剪贴板");
                     Log.Write("密码框检测命中, 拒绝写入, 文字入剪贴板 " + text.Length + "字");
+                    if (!SetClipboardAndRestore(text))
+                    {
+                        _toast.ShowToast("检测到密码框，且剪贴板不可用，未能保底复制");
+                        return;
+                    }
+                    _toast.ShowToast("检测到密码框，已拒绝写入，内容已复制到剪贴板");
                     return;
                 }
                 bool injected = false;
@@ -2724,7 +2825,16 @@ namespace VoxLeap
                 if (!injected)
                 {
                     // 目标可能是高权限窗口（UIPI 拦截）：兜底剪贴板 + Ctrl+V。
-                    try { Clipboard.SetText(text); } catch { }
+                    // 对抗审查 P1：SetText 失败（剪贴板被其他进程锁定）时不得继续 SendCtrlV，
+                    // 否则粘贴的是用户剪贴板里的旧内容（可能含敏感信息）却 toast 报成功。
+                    bool clipboardWritten = false;
+                    try { Clipboard.SetText(text); clipboardWritten = true; } catch { }
+                    if (!clipboardWritten)
+                    {
+                        _toast.ShowToast("写入失败：剪贴板当前不可用，请手动复制");
+                        Log.Write("写入失败: 剪贴板 SetText 被拒");
+                        return;
+                    }
                     uint sent2 = SendCtrlV();
                     if (sent2 == 4)
                     {
@@ -2732,8 +2842,8 @@ namespace VoxLeap
                         Log.Write("写入成功: " + text.Length + " 字, 路径=兜底剪贴板");
                         return;
                     }
-                    _toast.ShowToast("写入失败（目标可能有更高权限），已复制到剪贴板");
-                    Log.Write("写入失败: SendInput 与剪贴板均被拦截");
+                    _toast.ShowToast("写入失败（目标可能有更高权限），内容已在剪贴板，请手动粘贴");
+                    Log.Write("写入失败: Ctrl+V 被拦截，内容已留在剪贴板");
                     return;
                 }
                 _toast.ShowToastCentered("已输入 " + text.Length + " 字", target);
@@ -2741,7 +2851,12 @@ namespace VoxLeap
             }
             catch (Exception ex)
             {
-                SetClipboardAndRestore(text);
+                if (!SetClipboardAndRestore(text))
+                {
+                    _toast.ShowToast("写入失败，且剪贴板不可用，请手动复制");
+                    Log.Write("写入失败: " + ex.Message + "（剪贴板保底也失败）");
+                    return;
+                }
                 _toast.ShowToast("写入失败，已复制到剪贴板");
                 Log.Write("写入失败: " + ex.Message);
             }

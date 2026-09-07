@@ -1,13 +1,15 @@
 # 声跃 VoxLeap 项目进展
 
 <!-- pi:current:start -->
-## 当前接续点（整理于 2026-09-06）
+## 当前接续点（整理于 2026-09-07）
 
 - **项目目录**：`~/projects/声跃 VoxLeap`（本目录自带独立 `.git`，提交在本目录内操作；外层 `~` 也是仓库，勿把外层其他项目的改动一起提交）。
 - **当前目标**：稳定个人自用的 Windows 语音输入工具。验收以真实录音 → StepFun 识别 → 目标输入框写入及实际桌面效果为准。
 - **最新决定（2026-09-06，用户指示）**：
   1. 启动行为：双击快捷方式只驻留托盘、不弹任何窗口；设置窗口只能从托盘打开（双击托盘图标 / 右键“设置…”）。桌面快捷方式的 `--settings` 参数已在 Windows 侧移除；二次启动静默退出；显式 `--settings` 通过命名事件 `Local\VoxLeapOpenSettings` 转发给托盘进程。首启保留两种开窗例外：显式 `--settings`、未配置 Key（一次性引导）。
   2. 设置窗口按 Taste Skill 适配 WinForms 重设计：单一蓝青强调色 (23,121,138)、冷调中性灰阶、正文 9.5pt / 辅助 9pt（≥12px）、FlatTabs 下划线分页替代 TabControl、分区标题、辅助说明与控件左对齐、三级扁平按钮、底部细线操作区。字段、校验、DPAPI 密钥、服务切换逻辑全部保持不变。
+- **最新审查（2026-09-07 多 agent 对抗式）**：deepseek-v4-flash-0731（主审）、glm-5.3-flash（启动/IPC/资源）、step-3.7-flash（交互/可用性），3 模型 × 2 轮（独立审查→对抗互评）。结论 P0=0。**已修复 10 项**（4×P1 + 6×P2）：注入目标 PID 复核、keyup 丢失检测自动收尾、剪贴板 SetText 失败不再 Ctrl V、OnStart 异常停麦、钩子失败 toast、剪贴板恢复代次、自动收尾后抑制重复触发、ExtractPm 溢出防护、FlatTabs 补 Home/End、测试连接期禁环窗。归档 `~/ai-workspace/docs/reviews/REVIEW-*-voxleap-20260907-*.md`（含摘要）。
+- **已验证（WSL，2026-09-07）**：mcs 编译 0 error（仅既有 `_visualLevel` 告警）；SettingsCoreTest OK；VoxleapCoreTest 21/21；ExtractPcm 边界回归（null/空/正常/0x7FFFFFFF 大值）4/4。
 - **已验证（2026-09-06 实机）**：Windows csc 构建 OK；mcs 编译 OK；SettingsCoreTest OK、VoxleapCoreTest 21/21。快捷方式启动 → 托盘驻留无窗口（日志 `启动: hasKey=True hook=True`）；二次启动 → 静默退出、进程数 1（日志 `二次启动: 请求打开设置=False`）；运行中 `--settings` → 日志 `收到二次启动的设置请求` → `设置窗口已打开`，窗口 736×659（125% 缩放下物理 920×824）。截图留档 `~/Downloads/voxleap-settings-check.png`。
 - **尚未验收**：用户对新设置窗口的目视确认与长期使用；四种热键、toggle、Esc 取消、delta 字幕的完整实机矩阵（9-05 结转）。应用为 DPI-unaware，125% 缩放下由系统位图拉伸（既有行为，浮层同样受影响）；加 DPI 感知会改变浮层坐标计算，未动。
 - **进行中**：无。审查集群已结论（P0=0；P1×3 已修并随末次部署复验静默驻留）；glm 的启动期竞态 P1 与其余 P2 记 `TODO.md`。

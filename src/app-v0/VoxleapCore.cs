@@ -71,12 +71,15 @@ namespace VoxLeap
             int i = 12;
             while (i + 8 <= wav.Length)
             {
-                int size = wav[i + 4] | (wav[i + 5] << 8) | (wav[i + 6] << 16) | (wav[i + 7] << 24);
+                // 对抗审查 P2：size 由字节拼接，需防恶意/损坏 WAV 中 0x7FFFFFF8..0x7FFFFFFF
+                // 的正大值导致 8+size 整数溢出。用 long 计算并钳制到剩余长度，避免死循环或越界。
+                long size = (long)wav[i + 4] | ((long)wav[i + 5] << 8) | ((long)wav[i + 6] << 16) | ((long)wav[i + 7] << 24);
                 if (size < 0) break;
+                if (size > wav.Length - i - 8L) size = wav.Length - i - 8L; // 超出剩余数据视为损坏，钳制后继续
                 if (wav[i] == (byte)'d' && wav[i + 1] == (byte)'a' && wav[i + 2] == (byte)'t' && wav[i + 3] == (byte)'a')
                 {
                     int start = i + 8;
-                    int len = Math.Min(size, wav.Length - start);
+                    int len = (int)Math.Min(size, wav.Length - start);
                     if (len > 0)
                     {
                         var pcm = new byte[len];
@@ -84,7 +87,9 @@ namespace VoxLeap
                         return pcm;
                     }
                 }
-                i += 8 + size + (size & 1);
+                long next = i + 8L + size + (size & 1);
+                if (next > wav.Length || next <= i) break; // 不再前进则终止，防死循环
+                i = (int)next;
                 if (size == 0) break;
             }
             return wav;

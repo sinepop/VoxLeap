@@ -198,13 +198,15 @@ namespace VoxLeap
 
         protected override bool IsInputKey(Keys keyData)
         {
-            if (keyData == Keys.Left || keyData == Keys.Right) return true;
+            if (keyData == Keys.Left || keyData == Keys.Right
+                || keyData == Keys.Home || keyData == Keys.End) return true;
             return base.IsInputKey(keyData);
         }
 
         protected override void OnKeyDown(KeyEventArgs e)
         {
             base.OnKeyDown(e);
+            // 对抗审查 P2：补 Home/End 语义，与原生 TabControl 一致（文档 TODO）。
             if (e.KeyCode == Keys.Left)
             {
                 SelectedIndex = Math.Max(0, _selected - 1);
@@ -213,6 +215,16 @@ namespace VoxLeap
             else if (e.KeyCode == Keys.Right)
             {
                 SelectedIndex = Math.Min(_titles.Length - 1, _selected + 1);
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Home)
+            {
+                SelectedIndex = 0;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.End)
+            {
+                SelectedIndex = _titles.Length - 1;
                 e.Handled = true;
             }
         }
@@ -1194,6 +1206,19 @@ namespace VoxLeap
         {
             base.OnShown(e);
             if (!_baseConfig.HasKey) _apiKeyBox.Focus();
+        }
+
+        // 对抗审查 P2：连接测试期间禁止通过 X/Alt+F4 关窗，否则后台 HTTP 线程继续跑完、
+        // 且关闭消息队列下 BeginInvoke 回调静默丢弃，测试结果无处展示，还会耗尽配置的 API 配额。
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (_testing)
+            {
+                e.Cancel = true;
+                ShowError("连接测试尚未结束，请稍候。", null);
+                return;
+            }
+            base.OnFormClosing(e);
         }
     }
 }

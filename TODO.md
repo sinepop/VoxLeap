@@ -9,9 +9,22 @@
 - [x] P1 FlatTabs 首次 OnPaint 前命中测试失效 → `HitTest` 按需预热矩形，`OnResize` 清空重算。
 - [x] P2 连接测试期间取消按钮（含 Esc）未禁用，可能关窗丢回调或并发多个测试 → 测试期间禁用，完成回调恢复。
 
+## 已修复（2026-09-07，对抗式审查后）
+
+- [x] P1 注入目标只校验 IsWindow，未校验窗口身份：录音→注入窗口期内窗口销毁后句柄复用 → 文本写入未知窗口 → 记录 `_targetPid`，注入前 PID 复核不一致即拒绝（App.cs）。
+- [x] P1 keyup 丢失（Alt+Tab/UAC/安全桌面/RDP）录音悬挂，maxRecordMs=0 时无上限 → 10 分钟安全闸 + `HoldKeyStillDown` 键态检测自动收尾（App.cs）。
+- [x] P1 兜底剪贴板 SetText 失败仍 SendCtrlV 粘贴旧内容 → SetText 返回 bool，失败禁止粘贴并如实提示（App.cs）。
+- [x] P1 OnHoldStart 若浮层/GDI 抛异常只回 Idle 不停麦 → catch 补 `Recorder.Stop()` + `HideOverlay()`（App.cs）。
+- [x] P2 钩子安装失败（如杀软拦截）仅日志 → toast 提示一次（App.cs）。
+- [x] P2 剪贴板多恢复线程无代次 → 静态代次号仅最新代恢复（App.cs）。
+- [x] P2 自动收尾后按住热键 auto-repeat 白录第二轮 → `_suppressHotkeyUntil` 抑制 1s（App.cs）。
+- [x] P2 ExtractPcm 拼接 size 可能 int 溢生死循环 → long 计算 + 钳制（VoxleapCore.cs）。
+- [x] P2 FlatTabs 缺 Home/End → 补齐（SettingsForm.cs）。
+- [x] P2 测试连接期间 X/Alt+F4 可关窗丢回调 → `OnFormClosing` 拦测试期关闭（SettingsForm.cs）。
+
 ## 未修（P2，不阻塞）
 
-- [ ] FlatTabs 键盘仅 Left/Right，补 Home/End/Up/Down 语义（deepseek）。
+- [x] FlatTabs 键盘仅 Left/Right，补 Home/End 语义（deepseek → 2026-09-07 已补 Home/End；Up/Down 非原生 TabControl 语义，不补）。
 - [ ] 状态文本缺可访问性 live region（`AccessibleLiveSetting` / `RaiseAutomationEvent`），读屏不播报校验与测试结果（deepseek）。
 - [ ] footer `_statusLabel` 多行换行时在最小宽度 680 下可能挤压按钮列，需核对裁剪（deepseek）。
 - [ ] `ShowSettings` 的 BringToFront 分支缺「设置窗口已打开」日志，与新建分支不一致（deepseek）。
