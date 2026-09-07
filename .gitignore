@@ -19,3 +19,4 @@ obj/
 # Python/test caches
 __pycache__/
 *.py[cod]
+VoxLeap.exe

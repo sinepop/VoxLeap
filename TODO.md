@@ -1,7 +1,7 @@
 # 声跃 VoxLeap TODO（审查遗留）
 
 > 来源：2026-09-06 三模型只读审查集群（deepseek-v4-flash-0731、step-3.7-flash、glm-5.3-flash 均已完成）。
-> 结论：P0 = 0。归档见 `../../docs/reviews/REVIEW-*-voxleap-20260906.md`（即 ~/ai-workspace/docs/reviews/）。
+> 结论：P0 = 0。归档目录：外层工作区 `docs/reviews/`（REVIEW-*-voxleap-20260906.md 与 -20260907-* 系列）。
 
 ## 已修复（2026-09-06，随最后一次部署上线）
 
