@@ -15,6 +15,7 @@
 - **进行中**：无。审查集群已结论（P0=0；P1×3 已修并随末次部署复验静默驻留）；glm 的启动期竞态 P1 与其余 P2 记 `TODO.md`。
 - **下一步**：等用户实机目视新设置窗口与长期使用反馈；按 TODO.md 处理遗留 P2；补 9-05 结转的实机矩阵。
 - **记录方式**：后续实施任务在本区更新目标、最新决定、验证与下一步；保留下方历史。长期设计知识沿用本地知识库（Obsidian），按用户要求同步。
+- **已推送（2026-09-07）**：`https://github.com/sinepop/VoxLeap`（PUBLIC，main）。脱敏（移除本机用户名/绝对路径/UNC/vault 路径，删除跟踪的 VoxLeap.exe 并加入 .gitignore）后 force-push 覆盖远端；旧 test 分支已删；v0.1.0/v0.2.0 release（旧 exe 资产）保留，其 tag 历史含系统默认名 `Administrator`（非个人标识）。后续变更 `git push origin main` 即可。
 
 <!-- pi:current:end -->
 
