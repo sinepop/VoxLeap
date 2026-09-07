@@ -493,3 +493,39 @@
 - Windows csc 构建成功、已部署重启（hook=True、hasKey=True）；项目与运行目录 exe/App.cs SHA-256 一致。
 - 用户在两轮构建间真实使用一轮：识别 1.47s、写入 35 字成功（日志，无正文）。
 - 未自动触发任何 ASR 请求；四种热键、toggle 模式、Esc 取消、delta 字幕观感待用户实机反馈。
+
+## GitHub 推送与脱敏（2026-09-07）
+
+### 背景
+
+用户要求将项目推送至 GitHub，公开仓库 `https://github.com/sinepop/VoxLeap`（PUBLIC）。推送前执行完整脱敏审计。
+
+### 脱敏内容
+
+- **历史重写**：`git filter-branch` 全历史替换本机用户名 `xizhiyizhi`、绝对路径（`/home/...`）、UNC（`\\wsl.localhost\...`）、Obsidian vault 路径、`40 花果-项目` 条目；另清理 `C:\Users\Administrator\...` Windows 路径（系统默认账户名，非个人标识）。
+- **删除跟踪产物**：`VoxLeap.exe`（编译产物）全部历史移除，加入 `.gitignore`。
+- **孤儿清理**：`refs/original`、reflog、旧对象 `git gc --prune=now` 硬清除。
+- **核实**：全历史无密钥/录音/真实转写；`settings.template.json` 仅空 `apiKeyProtected`；测试语料为合成句。
+
+### 推送
+
+- main force-push 覆盖远端（本地脱敏历史 `0fee7fa`）；旧 test 分支删除。
+- 设置 origin remote，后续 `git push origin main` 即可。
+
+### Releases 重建
+
+- 旧 v0.1.0/v0.2.0 tag 删除（其提交含 `Administrator` 路径），对应 release 一并删除（旧资产备份至 `~/Downloads/voxleap-release-backup-20260907/`）。
+- 新 tag 指向脱敏历史：v0.1.0 → `e778ab0`，v0.2.0 → 最新提交；release 资产：
+  - v0.2.0：Windows csc 从脱敏源码重编译 exe（196KB，含 9-07 全部修复，字符串扫描零敏感）+ zip（README/template/ico）。
+  - v0.1.0：复用已确认干净的旧 zip。
+- 仓库现存 refs：`main`、`v0.1.0`、`v0.2.0`，无其它分支/tag。
+
+### 验证
+
+- csc 编译 0 错误；release 资产字符串扫描（用户名/路径/UNC）全部 0 命中；远端 refs 全量 ping 干净。
+- 链接：<https://github.com/sinepop/VoxLeap>
+
+### 待办 / 注意
+
+- v0.2.0 的 exe 为脱敏源码重编译（与实机 6-06 旧 exe 同编译器但更新），建议 Windows 侧重新实机复核一次（含 9-07 修复路径）。
+- 旧提交对象理论上可由持 SHA 者访问（公开仓库固有性质），无可达引用；如需彻底隐形可将仓库改 Private。
