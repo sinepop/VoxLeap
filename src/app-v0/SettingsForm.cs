@@ -308,9 +308,17 @@ namespace VoxLeap
         private ComboBox _hotkeyModeBox;
         private TextBox _hotwordsBox;
         private CheckBox _autoInsertBox;
+        private CheckBox _enableVadBox;
+        private CheckBox _aiOrganizeBox;
         private CheckBox _overrideEndpointBox;
         private NumericUpDown _maxRecordSeconds;
         private NumericUpDown _timeoutSeconds;
+        private NumericUpDown _vadThreshold;
+        private NumericUpDown _vadPaddingMs;
+        private TextBox _organizerBaseUrlBox;
+        private TextBox _organizerEndpointBox;
+        private TextBox _organizerModelBox;
+        private TextBox _organizerApiKeyBox;
         private readonly Label _statusLabel;
         private readonly Button _saveButton;
         private readonly Button _testButton;
@@ -646,6 +654,36 @@ namespace VoxLeap
             AddField(advanced, "热词", _hotwordsBox,
                 "一行一个或用逗号分隔，例如 VoxLeap、Cursor、TypeScript。是否生效取决于服务能力。", true);
 
+            AddSectionHeader(advanced, "端点检测与 AI 整理");
+
+            _enableVadBox = new CheckBox();
+            _enableVadBox.AutoSize = true;
+            _enableVadBox.Font = SettingsTheme.Body;
+            _enableVadBox.Text = "裁剪首尾静音（VAD）";
+            AddField(advanced, "VAD", _enableVadBox, "只做端点能量检测，不会分离录音中间的键盘声或咳嗽声。", false);
+
+            _vadThreshold = BuildNumeric(50, 10000, "VAD RMS 阈值");
+            AddField(advanced, "VAD 阈值", _vadThreshold, "默认 450；环境噪声较大时可适当提高。", false);
+            _vadPaddingMs = BuildNumeric(0, 2000, "VAD 前后保留毫秒");
+            AddField(advanced, "VAD 缓冲", WrapWithSuffix(_vadPaddingMs, "毫秒"), null, false);
+
+            _aiOrganizeBox = new CheckBox();
+            _aiOrganizeBox.AutoSize = true;
+            _aiOrganizeBox.Font = SettingsTheme.Body;
+            _aiOrganizeBox.Text = "启用 AI 整理";
+            _aiOrganizeBox.CheckedChanged += delegate { UpdateOrganizerUi(); };
+            AddField(advanced, "AI 整理", _aiOrganizeBox, "关闭时不会调用 LLM；整理失败或高风险变化会自动回退原文。", false);
+
+            _organizerBaseUrlBox = BuildTextBox("整理 Base URL");
+            AddField(advanced, "整理地址", _organizerBaseUrlBox, null, true);
+            _organizerEndpointBox = BuildTextBox("整理 endpoint");
+            AddField(advanced, "整理 Endpoint", _organizerEndpointBox, null, true);
+            _organizerModelBox = BuildTextBox("整理模型");
+            AddField(advanced, "整理模型", _organizerModelBox, null, true);
+            _organizerApiKeyBox = BuildTextBox("整理 API Key");
+            _organizerApiKeyBox.UseSystemPasswordChar = true;
+            AddField(advanced, "整理 API Key", _organizerApiKeyBox, "使用当前 Windows 账户 DPAPI 加密保存。", true);
+
             AddSectionHeader(advanced, "时长与超时");
 
             _maxRecordSeconds = BuildNumeric(0, 3600, "录音上限秒数");
@@ -891,6 +929,14 @@ namespace VoxLeap
             _autoInsertBox.Checked = cfg.AutoInsert;
             _maxRecordSeconds.Value = Clamp(_maxRecordSeconds, cfg.MaxRecordMs <= 0 ? 0m : (decimal)((cfg.MaxRecordMs + 999) / 1000));
             _timeoutSeconds.Value = Clamp(_timeoutSeconds, (decimal)((cfg.RequestTimeoutMs + 999) / 1000));
+            _enableVadBox.Checked = cfg.EnableVad;
+            _vadThreshold.Value = Clamp(_vadThreshold, cfg.VadThreshold);
+            _vadPaddingMs.Value = Clamp(_vadPaddingMs, cfg.VadPaddingMs);
+            _aiOrganizeBox.Checked = cfg.AiOrganize;
+            _organizerBaseUrlBox.Text = cfg.OrganizerBaseUrl;
+            _organizerEndpointBox.Text = cfg.OrganizerEndpoint;
+            _organizerModelBox.Text = cfg.OrganizerModel;
+            _organizerApiKeyBox.Text = cfg.OrganizerApiKey;
 
             if (cfg.Api == "transcriptions")
             {
@@ -902,6 +948,7 @@ namespace VoxLeap
             _currentApi = SelectedApi();
             _loading = false;
             UpdateServiceUi();
+            UpdateOrganizerUi();
 
             if (!string.IsNullOrEmpty(cfg.ParseIssue))
             {
@@ -1057,6 +1104,15 @@ namespace VoxLeap
                 : "高级兼容模式没有统一文档，请查阅所选服务商的官方 API 文档";
         }
 
+        private void UpdateOrganizerUi()
+        {
+            bool enabled = _aiOrganizeBox != null && _aiOrganizeBox.Checked;
+            if (_organizerBaseUrlBox != null) _organizerBaseUrlBox.Enabled = enabled;
+            if (_organizerEndpointBox != null) _organizerEndpointBox.Enabled = enabled;
+            if (_organizerModelBox != null) _organizerModelBox.Enabled = enabled;
+            if (_organizerApiKeyBox != null) _organizerApiKeyBox.Enabled = enabled;
+        }
+
         private Config ReadConfigFromForm()
         {
             Config updated = _baseConfig.Clone();
@@ -1072,6 +1128,14 @@ namespace VoxLeap
             updated.AutoInsert = _autoInsertBox.Checked;
             updated.MaxRecordMs = (int)_maxRecordSeconds.Value * 1000;
             updated.RequestTimeoutMs = (int)_timeoutSeconds.Value * 1000;
+            updated.EnableVad = _enableVadBox.Checked;
+            updated.VadThreshold = (int)_vadThreshold.Value;
+            updated.VadPaddingMs = (int)_vadPaddingMs.Value;
+            updated.AiOrganize = _aiOrganizeBox.Checked;
+            updated.OrganizerBaseUrl = _organizerBaseUrlBox.Text;
+            updated.OrganizerEndpoint = _organizerEndpointBox.Text;
+            updated.OrganizerModel = _organizerModelBox.Text;
+            updated.OrganizerApiKey = _organizerApiKeyBox.Text;
             updated.ParseIssue = "";
             updated.LoadedLegacyPlaintextKey = false;
             return ConfigValidator.Normalize(updated);

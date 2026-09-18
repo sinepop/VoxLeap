@@ -116,6 +116,14 @@ namespace VoxLeap
         public int ClipboardThreshold = 200;
         public int RequestTimeoutMs = 20000;
         public int MaxRecordMs = 300000; // 单次录音时长上限，0=不限制
+        public bool EnableVad = true;
+        public int VadThreshold = 450;
+        public int VadPaddingMs = 180;
+        public bool AiOrganize = false;
+        public string OrganizerBaseUrl = "";
+        public string OrganizerEndpoint = "/chat/completions";
+        public string OrganizerModel = "";
+        public string OrganizerApiKey = "";
         public string ParseIssue = ""; // 配置解析问题描述，供启动时提示
         public bool LoadedLegacyPlaintextKey = false; // 仅用于一次性 DPAPI 迁移，不写回配置
 
@@ -152,6 +160,14 @@ namespace VoxLeap
             ClipboardThreshold = other.ClipboardThreshold;
             RequestTimeoutMs = other.RequestTimeoutMs;
             MaxRecordMs = other.MaxRecordMs;
+            EnableVad = other.EnableVad;
+            VadThreshold = other.VadThreshold;
+            VadPaddingMs = other.VadPaddingMs;
+            AiOrganize = other.AiOrganize;
+            OrganizerBaseUrl = other.OrganizerBaseUrl;
+            OrganizerEndpoint = other.OrganizerEndpoint;
+            OrganizerModel = other.OrganizerModel;
+            OrganizerApiKey = other.OrganizerApiKey;
             ParseIssue = other.ParseIssue;
             LoadedLegacyPlaintextKey = other.LoadedLegacyPlaintextKey;
         }
@@ -684,6 +700,8 @@ namespace VoxLeap
         public bool Cancelled;
         public string Text = "";
         public string Error = "";
+        public string OrganizedText = "";
+        public string OrganizeError = "";
         public int HttpStatus;
         public double LatencySeconds;
     }
@@ -709,49 +727,22 @@ namespace VoxLeap
 
     internal static class AsrClient
     {
+        private static IStreamingAsrProvider CreateProvider(Config cfg)
+        {
+            if (cfg.Api == "sse") return new StepFunStreamingAsrProvider();
+            if (cfg.Api == "transcriptions") return new OpenAiCompatibleAsrProvider();
+            throw new InvalidOperationException("未支持的 ASR Provider: " + cfg.Api);
+        }
+
         public static AsrResult Transcribe(Config cfg, string wavPath, AsrSession session = null)
         {
             var result = new AsrResult();
             var sw = Stopwatch.StartNew();
-            HttpWebRequest req = null;
             try
             {
                 byte[] wav = File.ReadAllBytes(wavPath);
-                if (cfg.Api == "sse")
-                {
-                    return TranscribeSse(cfg, wav, sw, session);
-                }
-                string boundary = "----VoxLeapBoundary" + Guid.NewGuid().ToString("N");
-                string endpoint = cfg.Endpoint.StartsWith("/") ? cfg.Endpoint : "/" + cfg.Endpoint;
-                req = (HttpWebRequest)WebRequest.Create(cfg.BaseUrl + endpoint);
-                SetSessionRequest(session, req);
-                req.Method = "POST";
-                req.Timeout = cfg.RequestTimeoutMs;
-                req.ReadWriteTimeout = cfg.RequestTimeoutMs;
-                req.ContentType = "multipart/form-data; boundary=" + boundary;
-                req.Headers["Authorization"] = "Bearer " + cfg.ApiKey;
-
-                byte[] body = BuildMultipart(boundary, cfg.Model, wav);
-                req.ContentLength = body.Length;
-                using (var rs = req.GetRequestStream()) { rs.Write(body, 0, body.Length); }
-
-                using (var resp = (HttpWebResponse)req.GetResponse())
-                {
-                    string text = ReadAll(resp);
-                    result.HttpStatus = (int)resp.StatusCode;
-                    Match m = Regex.Match(text, "\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
-                    if (!m.Success)
-                    {
-                        result.Error = "响应里没有 text 字段";
-                        // 隐私约束：日志不记录响应正文，只记长度。
-                        Log.Write("响应缺少text字段, 响应长度=" + text.Length);
-                    }
-                    else
-                    {
-                        result.Text = JsonUtil.Unescape(m.Groups[1].Value);
-                        result.Ok = true;
-                    }
-                }
+                IStreamingAsrProvider provider = CreateProvider(cfg);
+                return provider.Transcribe(cfg, PrepareAudio(cfg, wav), session);
             }
             catch (WebException wex)
             {
@@ -763,15 +754,15 @@ namespace VoxLeap
             }
             finally
             {
-                ClearSessionRequest(session, req);
                 result.LatencySeconds = sw.Elapsed.TotalSeconds;
             }
             return result;
         }
 
         // Step Plan 订阅专用：POST /step_plan/v1/audio/asr/sse，JSON + base64 PCM，SSE 流式返回。
-        private static AsrResult TranscribeSse(Config cfg, byte[] wav, Stopwatch sw, AsrSession session)
+        internal static AsrResult TranscribeStepFun(Config cfg, byte[] wav, AsrSession session)
         {
+            Stopwatch sw = Stopwatch.StartNew();
             var result = new AsrResult();
             HttpWebRequest req = null;
             try
@@ -833,6 +824,7 @@ namespace VoxLeap
                                 result.Error = SummarizeError(result.HttpStatus, payload);
                                 return result;
                             }
+
                             if (!hasText) continue;
                             if (type == "transcript.text.done")
                             {
@@ -867,6 +859,16 @@ namespace VoxLeap
                 result.LatencySeconds = sw.Elapsed.TotalSeconds;
             }
             return result;
+        }
+
+        private static byte[] PrepareAudio(Config cfg, byte[] wav)
+        {
+            if (!cfg.EnableVad) return wav;
+            byte[] pcm = VoxleapCore.ExtractPcm(wav);
+            byte[] trimmed = VoxleapCore.TrimSilencePcm(pcm, 16000, cfg.VadThreshold, cfg.VadPaddingMs);
+            if (trimmed.Length == 0) return wav;
+            Log.Write("VAD: " + pcm.Length + " -> " + trimmed.Length + " bytes");
+            return VoxleapCore.CreatePcmWav(trimmed, 16000);
         }
 
         private static void SetSessionRequest(AsrSession session, HttpWebRequest request)
@@ -1935,13 +1937,15 @@ namespace VoxLeap
         private readonly Action<string> _onWrite;
         private readonly Action<string> _onCopied;
         private readonly string _original;
+        private readonly string _sourceText;
         private bool _finished;
 
-        public ReviewForm(string text, string meta, Action<string> onWrite, Action<string> onCopied)
+        public ReviewForm(string text, string sourceText, string meta, Action<string> onWrite, Action<string> onCopied)
         {
             _onWrite = onWrite;
             _onCopied = onCopied;
             _original = text ?? "";
+            _sourceText = sourceText ?? "";
 
             Size = new Size(660, 314);
             CornerRadius = 32;
@@ -2003,6 +2007,11 @@ namespace VoxLeap
             _count.ForeColor = Color.FromArgb(108, 130, 130);
             _count.BackColor = Color.Transparent;
 
+            var sourceBtn = MakeButton("查看原文", Color.FromArgb(245, 250, 248), Color.FromArgb(52, 72, 74), false);
+            sourceBtn.Location = new Point(25, 260);
+            sourceBtn.Size = new Size(96, 38);
+            sourceBtn.Click += delegate { _box.Text = _sourceText; };
+
             var writeBtn = MakeButton("写入光标处", Color.FromArgb(220, 241, 236), Color.FromArgb(21, 81, 90), true);
             writeBtn.Location = new Point(336, 260);
             writeBtn.Size = new Size(148, 38);
@@ -2043,6 +2052,7 @@ namespace VoxLeap
             Controls.Add(_meta);
             Controls.Add(hint);
             Controls.Add(_count);
+            Controls.Add(sourceBtn);
             Controls.Add(writeBtn);
             Controls.Add(copyBtn);
             Controls.Add(cancelBtn);
@@ -2612,6 +2622,29 @@ namespace VoxLeap
             try
             {
                 res = AsrClient.Transcribe(_cfg, wav, session);
+                if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
+                {
+                    ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();
+                    OrganizerResult organized = transformer.Transform(_cfg, res.Text, session);
+                    if (session.Cancelled)
+                    {
+                        res.Cancelled = true;
+                        res.Error = "已取消";
+                    }
+                    else if (organized.Ok)
+                    {
+                        VoxleapCore.TextSafetyReport safety =
+                            VoxleapCore.ValidateOrganizedText(res.Text, organized.Text);
+                        if (safety.Safe) res.OrganizedText = organized.Text;
+                        else res.OrganizeError = safety.Reason;
+                    }
+                    else
+                    {
+                        res.OrganizeError = organized.Error;
+                        Log.Write("AI 整理失败，保留原文: " + organized.Error);
+                    }
+                }
+                if (session.Cancelled) res.Cancelled = true;
             }
             catch (Exception ex)
             {
@@ -2646,9 +2679,14 @@ namespace VoxLeap
                         _toast.ShowToast("已取消，文字未保留");
                         return;
                     }
-                    string text = NormalizeCjkLatinSpacing(res.Text ?? "");
+                    string originalText = NormalizeCjkLatinSpacing(res.Text ?? "");
+                    string text = !string.IsNullOrEmpty(res.OrganizedText)
+                        ? NormalizeCjkLatinSpacing(res.OrganizedText)
+                        : originalText;
                     if (res.Ok && !string.IsNullOrEmpty(text))
                     {
+                        if (!string.IsNullOrEmpty(res.OrganizeError))
+                            _toast.ShowToast("AI 整理失败，已使用原文");
                         if (_cfg.AutoInsert)
                         {
                             // 自动输入模式（用户主动开启）：跳过审阅，直接写入按下热键时捕获的目标。
@@ -2657,8 +2695,10 @@ namespace VoxLeap
                         }
                         else
                         {
-                            string meta = "阶跃星辰 · " + _cfg.Model + " · 用时 " + res.LatencySeconds.ToString("0.0") + "s";
-                            var review = new ReviewForm(text, meta, delegate(string editedText) { InjectText(editedText); },
+                            string meta = "原文保留 · " + _cfg.Model + " · 用时 " + res.LatencySeconds.ToString("0.0") + "s";
+                            if (!string.IsNullOrEmpty(res.OrganizedText))
+                                meta = "AI 整理 · 原文可恢复 · " + _cfg.OrganizerModel;
+                            var review = new ReviewForm(text, originalText, meta, delegate(string editedText) { InjectText(editedText); },
                                 delegate(string msg) { _toast.ShowToast(msg); });
                             _state = State.Reviewing;
                             review.FormClosed += delegate { _state = State.Idle; };

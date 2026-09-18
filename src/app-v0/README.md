@@ -43,6 +43,10 @@
 - 录音热键（右 Ctrl / 右 Alt / 右 Shift / Caps Lock）
 - 触发方式（按住说话 / 按一次开始，再按一次结束）
 - 热词
+- VAD（默认开启）：按 16 kHz PCM RMS 去除首尾静音，并将超过 800ms 的中间长静音压缩为短停顿，保留可配置前后缓冲
+- AI 整理（可选）：通过 OpenAI 兼容 `/chat/completions` 整理，原文始终保留
+- 整理安全门：数字、URL、技术 Token 或否定关系发生风险变化时自动回退原文
+- 设置窗口的“高级”页可配置 VAD 阈值/缓冲与整理服务地址、模型和密钥
 - 自动输入
 - 录音上限（秒，0=不限制）
 - 请求超时（秒）
@@ -97,6 +101,14 @@ Protocol: JSON + base64 PCM + SSE
 | `clipboardThreshold` | 长文本转剪贴板注入阈值 |
 | `requestTimeoutMs` | 请求超时（毫秒） |
 | `maxRecordMs` | 单次录音上限（毫秒，0=不限制） |
+| `enableVad` | 是否去除首尾静音 |
+| `vadThreshold` | VAD RMS 阈值（默认 450） |
+| `vadPaddingMs` | VAD 前后保留毫秒数（默认 180） |
+| `aiOrganize` | 是否调用生成式整理，默认关闭 |
+| `organizerBaseUrl` | 整理服务根地址 |
+| `organizerEndpoint` | 整理 endpoint，默认 `/chat/completions` |
+| `organizerModel` | 整理模型 |
+| `organizerApiKeyProtected` | DPAPI 加密的整理 API Key |
 
 ## 构建
 
@@ -127,5 +139,7 @@ build.cmd
 ## 已知限制
 
 - 实时字幕来自 SSE 增量 `delta` 的累积显示，不代表完整逐词最终结果；
+- StepFun 仍是“整段上传后 SSE 回放”，并非真正的音频分片流式；ASR 已通过 `IStreamingAsrProvider` 隔离，后续可替换为 WebSocket/分片实现；
+- 当前 VAD 是保守的能量门控，不是神经网络 VAD；它只压缩首尾和中间长静音，不会从重叠键盘声中分离人声；
 - 浏览器/Electron 密码框并非都能被 Win32 `ES_PASSWORD` 检出；
 - “OpenAI 兼容转写（高级，未验证）”仅作为高级手动配置入口，兼容性未实测。

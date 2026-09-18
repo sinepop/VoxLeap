@@ -61,6 +61,10 @@ namespace VoxLeap
             normalized.Hotkey = (normalized.Hotkey ?? "").Trim();
             normalized.HotkeyMode = (normalized.HotkeyMode ?? "").Trim();
             normalized.Hotwords = NormalizeHotwords(normalized.Hotwords);
+            normalized.OrganizerBaseUrl = (normalized.OrganizerBaseUrl ?? "").Trim().TrimEnd('/');
+            normalized.OrganizerEndpoint = NormalizeEndpoint(normalized.OrganizerEndpoint);
+            normalized.OrganizerModel = (normalized.OrganizerModel ?? "").Trim();
+            normalized.OrganizerApiKey = (normalized.OrganizerApiKey ?? "").Trim();
             return normalized;
         }
 
@@ -134,6 +138,32 @@ namespace VoxLeap
             if (cfg.ClipboardThreshold < 1 || cfg.ClipboardThreshold > 100000)
             {
                 result.Errors.Add("长文本剪贴板阈值超出允许范围。");
+            }
+            if (cfg.VadThreshold < 50 || cfg.VadThreshold > 10000)
+            {
+                result.Errors.Add("VAD 阈值需在 50～10000 之间。");
+            }
+            if (cfg.VadPaddingMs < 0 || cfg.VadPaddingMs > 2000)
+            {
+                result.Errors.Add("VAD 前后保留需在 0～2000 毫秒之间。");
+            }
+            if (cfg.AiOrganize)
+            {
+                if (cfg.OrganizerBaseUrl.Length == 0)
+                    result.Errors.Add("已开启 AI 整理，但整理服务 Base URL 为空。");
+                else if (Uri.TryCreate(cfg.OrganizerBaseUrl, UriKind.Absolute, out uri))
+                {
+                    bool loopbackOrganizer = uri.Scheme == Uri.UriSchemeHttp && uri.IsLoopback;
+                    if (uri.Scheme != Uri.UriSchemeHttps && !loopbackOrganizer)
+                        result.Errors.Add("整理服务远程地址必须使用 HTTPS；HTTP 仅允许本机回环地址。");
+                }
+                else result.Errors.Add("整理服务 Base URL 必须是完整地址。");
+                if (!cfg.OrganizerEndpoint.StartsWith("/"))
+                    result.Errors.Add("整理 endpoint 必须以 / 开头。");
+                if (cfg.OrganizerModel.Length == 0)
+                    result.Errors.Add("已开启 AI 整理，但整理模型为空。");
+                if (cfg.OrganizerApiKey.Length == 0)
+                    result.Errors.Add("已开启 AI 整理，但整理 API Key 为空。");
             }
             return result;
         }
@@ -233,6 +263,7 @@ namespace VoxLeap
                 int intValue;
                 string legacyApiKey = "";
                 string protectedApiKey = "";
+                string protectedOrganizerKey = "";
 
                 if (TryReadString(json, "baseUrl", out value)) cfg.BaseUrl = value.Trim().TrimEnd('/');
                 if (TryReadString(json, "endpoint", out value)) cfg.Endpoint = value;
@@ -240,6 +271,7 @@ namespace VoxLeap
                 if (TryReadString(json, "api", out value)) cfg.Api = value.Trim();
                 if (TryReadString(json, "apiKey", out value)) legacyApiKey = value.Trim();
                 if (TryReadString(json, "apiKeyProtected", out value)) protectedApiKey = value.Trim();
+                if (TryReadString(json, "organizerApiKeyProtected", out value)) protectedOrganizerKey = value.Trim();
                 if (TryReadBool(json, "autoInsert", out boolValue)) cfg.AutoInsert = boolValue;
                 if (TryReadString(json, "language", out value)) cfg.Language = value;
                 if (TryReadString(json, "hotkey", out value)) cfg.Hotkey = value;
@@ -248,6 +280,14 @@ namespace VoxLeap
                 if (TryReadInt(json, "clipboardThreshold", out intValue)) cfg.ClipboardThreshold = intValue;
                 if (TryReadInt(json, "requestTimeoutMs", out intValue)) cfg.RequestTimeoutMs = intValue;
                 if (TryReadInt(json, "maxRecordMs", out intValue)) cfg.MaxRecordMs = intValue;
+                if (TryReadBool(json, "enableVad", out boolValue)) cfg.EnableVad = boolValue;
+                if (TryReadInt(json, "vadThreshold", out intValue)) cfg.VadThreshold = intValue;
+                if (TryReadInt(json, "vadPaddingMs", out intValue)) cfg.VadPaddingMs = intValue;
+                if (TryReadBool(json, "aiOrganize", out boolValue)) cfg.AiOrganize = boolValue;
+                if (TryReadString(json, "organizerBaseUrl", out value)) cfg.OrganizerBaseUrl = value;
+                if (TryReadString(json, "organizerEndpoint", out value)) cfg.OrganizerEndpoint = value;
+                if (TryReadString(json, "organizerModel", out value)) cfg.OrganizerModel = value;
+                if (TryReadString(json, "organizerApiKey", out value)) cfg.OrganizerApiKey = value;
 
                 if (!string.IsNullOrEmpty(protectedApiKey) && protector != null)
                 {
@@ -266,6 +306,11 @@ namespace VoxLeap
                     cfg.ApiKey = legacyApiKey;
                     cfg.LoadedLegacyPlaintextKey = cfg.HasKey;
                 }
+                if (!string.IsNullOrEmpty(protectedOrganizerKey) && protector != null)
+                {
+                    try { cfg.OrganizerApiKey = protector.Unprotect(protectedOrganizerKey); }
+                    catch (Exception ex) { cfg.ParseIssue = "organizerApiKeyProtected 解密失败: " + ex.Message; }
+                }
             }
             catch (Exception ex)
             {
@@ -279,10 +324,13 @@ namespace VoxLeap
         {
             Config normalized = ConfigValidator.Normalize(cfg);
             string protectedApiKey = "";
+            string protectedOrganizerKey = "";
             if (normalized.HasKey && protector != null)
             {
                 protectedApiKey = protector.Protect(normalized.ApiKey);
             }
+            if (protector != null && !string.IsNullOrEmpty(normalized.OrganizerApiKey))
+                protectedOrganizerKey = protector.Protect(normalized.OrganizerApiKey);
 
             var sb = new StringBuilder();
             sb.Append("{\r\n");
@@ -298,7 +346,15 @@ namespace VoxLeap
             AppendString(sb, "hotwords", normalized.Hotwords, true);
             AppendInt(sb, "clipboardThreshold", normalized.ClipboardThreshold, true);
             AppendInt(sb, "requestTimeoutMs", normalized.RequestTimeoutMs, true);
-            AppendInt(sb, "maxRecordMs", normalized.MaxRecordMs, false);
+            AppendInt(sb, "maxRecordMs", normalized.MaxRecordMs, true);
+            AppendBool(sb, "enableVad", normalized.EnableVad, true);
+            AppendInt(sb, "vadThreshold", normalized.VadThreshold, true);
+            AppendInt(sb, "vadPaddingMs", normalized.VadPaddingMs, true);
+            AppendBool(sb, "aiOrganize", normalized.AiOrganize, true);
+            AppendString(sb, "organizerBaseUrl", normalized.OrganizerBaseUrl, true);
+            AppendString(sb, "organizerEndpoint", normalized.OrganizerEndpoint, true);
+            AppendString(sb, "organizerModel", normalized.OrganizerModel, true);
+            AppendString(sb, "organizerApiKeyProtected", protectedOrganizerKey, false);
             sb.Append("}\r\n");
             return sb.ToString();
         }

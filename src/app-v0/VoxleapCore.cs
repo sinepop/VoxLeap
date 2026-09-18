@@ -12,6 +12,12 @@ namespace VoxLeap
 {
     internal static class VoxleapCore
     {
+        public sealed class TextSafetyReport
+        {
+            public bool Safe;
+            public string Reason = "";
+        }
+
         // ---- JSON 字段值转义（用于请求体组装）----
         public static string EscapeJson(string s)
         {
@@ -95,6 +101,128 @@ namespace VoxLeap
             return wav;
         }
 
+        public static byte[] TrimSilencePcm(byte[] pcm, int sampleRate, int threshold, int paddingMs)
+        {
+            if (pcm == null || pcm.Length < 2 || sampleRate <= 0) return pcm;
+            int samples = pcm.Length / 2;
+            int frame = Math.Max(80, sampleRate / 100);
+            int first = -1;
+            int last = -1;
+            for (int start = 0; start < samples; start += frame)
+            {
+                int end = Math.Min(samples, start + frame);
+                long sum = 0;
+                for (int i = start; i < end; i++)
+                {
+                    short value = BitConverter.ToInt16(pcm, i * 2);
+                    sum += (long)value * value;
+                }
+                double rms = Math.Sqrt(sum / (double)Math.Max(1, end - start));
+                if (rms >= threshold)
+                {
+                    if (first < 0) first = start;
+                    last = end;
+                }
+            }
+            if (first < 0) return new byte[0];
+            int padding = sampleRate * Math.Max(0, paddingMs) / 1000;
+            first = Math.Max(0, first - padding);
+            last = Math.Min(samples, last + padding);
+            int length = (last - first) * 2;
+            var trimmed = new byte[length];
+            Buffer.BlockCopy(pcm, first * 2, trimmed, 0, length);
+            return CompactInternalSilencePcm(trimmed, sampleRate, threshold, 800, Math.Min(180, paddingMs));
+        }
+
+        public static byte[] CompactInternalSilencePcm(byte[] pcm, int sampleRate, int threshold, int maxGapMs, int keepGapMs)
+        {
+            if (pcm == null || pcm.Length < 2 || sampleRate <= 0 || maxGapMs <= 0) return pcm;
+            int samples = pcm.Length / 2;
+            int frame = Math.Max(80, sampleRate / 100);
+            int maxSilentFrames = Math.Max(1, maxGapMs * sampleRate / 1000 / frame);
+            int keepSamples = Math.Max(0, keepGapMs) * sampleRate / 1000;
+            var output = new System.Collections.Generic.List<byte>(pcm.Length);
+            int silentStart = -1;
+            for (int start = 0; start < samples; start += frame)
+            {
+                int end = Math.Min(samples, start + frame);
+                long sum = 0;
+                for (int i = start; i < end; i++)
+                {
+                    short value = BitConverter.ToInt16(pcm, i * 2);
+                    sum += (long)value * value;
+                }
+                bool voiced = Math.Sqrt(sum / (double)Math.Max(1, end - start)) >= threshold;
+                if (voiced)
+                {
+                    if (silentStart >= 0)
+                    {
+                        int silentSamples = start - silentStart;
+                        int copySamples = silentSamples > maxSilentFrames * frame
+                            ? Math.Min(keepSamples, silentSamples)
+                            : silentSamples;
+                        AppendPcm(output, pcm, silentStart, copySamples);
+                        silentStart = -1;
+                    }
+                    AppendPcm(output, pcm, start, end - start);
+                }
+                else if (silentStart < 0)
+                {
+                    silentStart = start;
+                }
+            }
+            if (silentStart >= 0)
+            {
+                int silentSamples = samples - silentStart;
+                AppendPcm(output, pcm, silentStart, silentSamples > maxSilentFrames * frame
+                    ? Math.Min(keepSamples, silentSamples)
+                    : silentSamples);
+            }
+            return output.ToArray();
+        }
+
+        private static void AppendPcm(System.Collections.Generic.List<byte> output, byte[] pcm, int sampleStart, int sampleCount)
+        {
+            if (sampleCount <= 0) return;
+            int offset = sampleStart * 2;
+            int length = Math.Min(sampleCount * 2, pcm.Length - offset);
+            for (int i = 0; i < length; i++) output.Add(pcm[offset + i]);
+        }
+
+        public static byte[] CreatePcmWav(byte[] pcm, int sampleRate)
+        {
+            pcm = pcm ?? new byte[0];
+            var wav = new byte[44 + pcm.Length];
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("RIFF"), 0, wav, 0, 4);
+            WriteInt32(wav, 4, 36 + pcm.Length);
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("WAVEfmt "), 0, wav, 8, 8);
+            WriteInt32(wav, 16, 16);
+            WriteInt16(wav, 20, 1);
+            WriteInt16(wav, 22, 1);
+            WriteInt32(wav, 24, sampleRate);
+            WriteInt32(wav, 28, sampleRate * 2);
+            WriteInt16(wav, 32, 2);
+            WriteInt16(wav, 34, 16);
+            Buffer.BlockCopy(Encoding.ASCII.GetBytes("data"), 0, wav, 36, 4);
+            WriteInt32(wav, 40, pcm.Length);
+            Buffer.BlockCopy(pcm, 0, wav, 44, pcm.Length);
+            return wav;
+        }
+
+        private static void WriteInt16(byte[] bytes, int offset, int value)
+        {
+            bytes[offset] = (byte)value;
+            bytes[offset + 1] = (byte)(value >> 8);
+        }
+
+        private static void WriteInt32(byte[] bytes, int offset, int value)
+        {
+            bytes[offset] = (byte)value;
+            bytes[offset + 1] = (byte)(value >> 8);
+            bytes[offset + 2] = (byte)(value >> 16);
+            bytes[offset + 3] = (byte)(value >> 24);
+        }
+
         // ---- 中英文交界空格收拢（英文短语内部空格保留）----
         public static string NormalizeCjkLatinSpacing(string text)
         {
@@ -102,6 +230,57 @@ namespace VoxLeap
             const string cjk = "\\u3400-\\u4DBF\\u4E00-\\u9FFF\\uF900-\\uFAFF";
             text = Regex.Replace(text, @"(?<=[" + cjk + @"])[\t \u3000]+(?=[A-Za-z])", "");
             return Regex.Replace(text, @"(?<=[A-Za-z])[\t \u3000]+(?=[" + cjk + @"])", "");
+        }
+
+        public static TextSafetyReport ValidateOrganizedText(string original, string candidate)
+        {
+            var report = new TextSafetyReport();
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                report.Reason = "整理结果为空";
+                return report;
+            }
+            if (original == null) original = "";
+            string source = NormalizeProtectedText(original);
+            string output = NormalizeProtectedText(candidate);
+            MatchCollection sourceTokens = Regex.Matches(source, @"https?://[^\s，。！？,!?]+|(?<![A-Za-z])\d+(?:\.\d+)*(?!\d)|[A-Za-z_][A-Za-z0-9_./:-]*[_./:-][A-Za-z0-9_./:-]*");
+            foreach (Match token in sourceTokens)
+            {
+                if (output.IndexOf(token.Value, StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    report.Reason = "高风险 Token 未保留: " + token.Value;
+                    return report;
+                }
+            }
+            string[] negatives = { "不", "没", "无", "未", "禁止", "不要", "不能", "不会", "not", "no", "never", "cannot", "don't" };
+            for (int i = 0; i < negatives.Length; i++)
+            {
+                int sourceCount = CountToken(source, negatives[i]);
+                if (sourceCount > 0 && CountToken(output, negatives[i]) < sourceCount)
+                {
+                    report.Reason = "否定关系可能被改变: " + negatives[i];
+                    return report;
+                }
+            }
+            report.Safe = true;
+            return report;
+        }
+
+        private static string NormalizeProtectedText(string text)
+        {
+            return (text ?? "").Replace("，", ",").Replace("。", ".").Replace("：", ":").Replace("／", "/");
+        }
+
+        private static int CountToken(string text, string token)
+        {
+            int count = 0;
+            int index = 0;
+            while ((index = text.IndexOf(token, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                count++;
+                index += token.Length;
+            }
+            return count;
         }
     }
 }

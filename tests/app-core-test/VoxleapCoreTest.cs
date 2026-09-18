@@ -92,6 +92,36 @@ internal static class Runner
         CheckEq("空值安全", VoxleapCore.NormalizeCjkLatinSpacing(""), "");
         CheckEq("null 安全", VoxleapCore.NormalizeCjkLatinSpacing(null), null);
 
+        // ---- VAD ----
+        var audio = new byte[16000 * 2];
+        for (int i = 4000; i < 12000; i++)
+        {
+            audio[i * 2] = 0x00;
+            audio[i * 2 + 1] = 0x20;
+        }
+        byte[] trimmed = VoxleapCore.TrimSilencePcm(audio, 16000, 450, 0);
+        Check("VAD 去除首尾静音", trimmed.Length > 0 && trimmed.Length < audio.Length);
+        Check("VAD 全静音不伪造语音", VoxleapCore.TrimSilencePcm(new byte[3200], 16000, 450, 0).Length == 0);
+        Check("WAV 重建保留 PCM", VoxleapCore.ExtractPcm(VoxleapCore.CreatePcmWav(trimmed, 16000)).Length == trimmed.Length);
+        var splitAudio = new byte[16000 * 4 * 2];
+        for (int i = 0; i < 8000; i++)
+        {
+            splitAudio[i * 2 + 1] = 0x20;
+            splitAudio[(i + 48000) * 2 + 1] = 0x20;
+        }
+        byte[] compacted = VoxleapCore.CompactInternalSilencePcm(splitAudio, 16000, 450, 800, 180);
+        Check("VAD 压缩中间长静音", compacted.Length < splitAudio.Length && compacted.Length >= 16000);
+        Check("VAD 保留短停顿", VoxleapCore.CompactInternalSilencePcm(splitAudio, 16000, 450, 5000, 180).Length == splitAudio.Length);
+
+        // ---- AI 整理安全校验 ----
+        Check("整理稿保留数字和 URL", VoxleapCore.ValidateOrganizedText(
+            "请打开 https://example.com/api/v1，使用版本 2.1。",
+            "请打开 https://example.com/api/v1，使用版本 2.1。").Safe);
+        Check("整理稿丢失版本号必须阻断", !VoxleapCore.ValidateOrganizedText(
+            "发布版本 2.1。", "发布版本 2.2。").Safe);
+        Check("整理稿改变否定关系必须阻断", !VoxleapCore.ValidateOrganizedText(
+            "不要删除这个文件。", "删除这个文件。").Safe);
+
         Console.WriteLine("----");
         Console.WriteLine("passed=" + _passed + " failed=" + _failed);
         return _failed == 0 ? 0 : 1;

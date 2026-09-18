@@ -11,5 +11,13 @@
   "hotwords": "",
   "clipboardThreshold": 200,
   "requestTimeoutMs": 20000,
-  "maxRecordMs": 300000
+  "maxRecordMs": 300000,
+  "enableVad": true,
+  "vadThreshold": 450,
+  "vadPaddingMs": 180,
+  "aiOrganize": false,
+  "organizerBaseUrl": "",
+  "organizerEndpoint": "/chat/completions",
+  "organizerModel": "",
+  "organizerApiKeyProtected": ""
 }
