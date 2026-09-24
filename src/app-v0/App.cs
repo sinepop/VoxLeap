@@ -417,6 +417,27 @@ namespace VoxLeap
         private static WaveInLevelMonitor _levelMonitor;
         private static int _levelMilli;
 
+        // ---- 实时分段（影子模式）：只观察、只记录，不改变录音/识别/注入的任何行为 ----
+        // 分界 600ms / 收尾 1200ms 是待验证的观察参数，不是用户设置。等真实录音日志
+        // 确认阈值合理后，再让它真正驱动「静音自动停止」与「边说边送」。
+        private const int ShadowMinSpeechMs = 300;
+        private const int ShadowSplitSilenceMs = 600;
+        private const int ShadowEndSilenceMs = 1200;
+        private static SpeechSegmenter _segmenter;
+        private static readonly object _segmenterGate = new object();
+
+        // 由 waveIn 回调线程逐帧调用（每 100ms 一次）。只做纯内存计算，不做磁盘或网络 I/O，
+        // 避免在音频回调里引入阻塞。
+        private static void OnAudioFrame(double rmsRaw, int bytesRecorded)
+        {
+            lock (_segmenterGate)
+            {
+                if (_segmenter == null) return;
+                _segmenter.NoteAudioBytes(bytesRecorded);
+                _segmenter.Feed(rmsRaw);
+            }
+        }
+
         [DllImport("winmm.dll", CharSet = CharSet.Auto)]
         private static extern int mciSendString(string command, StringBuilder buffer, int bufferSize, IntPtr callback);
 
@@ -428,7 +449,7 @@ namespace VoxLeap
             return err;
         }
 
-        public static bool Start()
+        public static bool Start(int vadThreshold)
         {
             Stop();
             if (Send("open new type waveaudio alias " + Alias) != 0) return false;
@@ -440,6 +461,13 @@ namespace VoxLeap
             }
             _open = true;
             _levelMilli = 0;
+            // 与批处理 VAD 同口径：把 vadThreshold 的 16bit RMS 换算成归一化 RMS，
+            // 避免实时分段与事后 VAD 出现两套互相矛盾的阈值。
+            double speechRms = Math.Max(1, vadThreshold) / 32768.0;
+            lock (_segmenterGate)
+            {
+                _segmenter = new SpeechSegmenter(100, speechRms, ShadowMinSpeechMs, ShadowSplitSilenceMs, ShadowEndSilenceMs);
+            }
             try
             {
                 _levelMonitor = new WaveInLevelMonitor();
@@ -465,6 +493,7 @@ namespace VoxLeap
             int err = Send("save " + Alias + " \"" + wavPath + "\"");
             Send("close " + Alias);
             _open = false;
+            LogSegmentShadow();
             return err == 0 && File.Exists(wavPath);
         }
 
@@ -475,6 +504,29 @@ namespace VoxLeap
             Send("stop " + Alias);
             Send("close " + Alias);
             _open = false;
+            LogSegmentShadow();
+        }
+
+        // 停止后调用。StopLevelMonitor 已等待 waveIn 回调全部回收，因此此时摘除分段器
+        // 不存在与回调线程的竞态。
+        private static void LogSegmentShadow()
+        {
+            SpeechSegmenter seg;
+            lock (_segmenterGate)
+            {
+                seg = _segmenter;
+                _segmenter = null;
+            }
+            if (seg == null) return;
+            try
+            {
+                seg.Finish(); // 先补记末尾静音游程，再输出摘要
+                Log.Write(seg.ToLogLine());
+            }
+            catch (Exception ex)
+            {
+                Log.Write("分段影子结算失败: " + ex.Message);
+            }
         }
 
         public static float GetLevel()
@@ -558,6 +610,7 @@ namespace VoxLeap
             private IntPtr[] _buffers;
             private int _stopping;
             private int _outstanding; // 仍在队列（等待回调）的缓冲区数量
+            private byte[] _frame;    // 复用的一帧托管副本；回调只有一个 waveIn 分发线程，可安全复用
 
             public WaveInLevelMonitor()
             {
@@ -669,15 +722,23 @@ namespace VoxLeap
                 try
                 {
                     WaveHeader header = (WaveHeader)Marshal.PtrToStructure(parameter1, typeof(WaveHeader));
-                    int samples = (int)header.dwBytesRecorded / 2;
+                    int bytes = (int)header.dwBytesRecorded;
+                    if (bytes < 0) bytes = 0;
+                    if (bytes > BufferBytes) bytes = BufferBytes; // 防御：异常驱动可能报超出缓冲区的值
+                    // 一次 Marshal.Copy 取代逐样本 Marshal.ReadInt16：快得多，而且顺带把本帧 PCM
+                    // 落进托管内存——那正是实时分段（以及后续"边说边送"）需要的字节。
+                    if (_frame == null) _frame = new byte[BufferBytes];
+                    if (bytes > 0) Marshal.Copy(header.lpData, _frame, 0, bytes);
+                    int samples = bytes / 2;
                     double sum = 0;
                     for (int i = 0; i < samples; i++)
                     {
-                        short sample = Marshal.ReadInt16(header.lpData, i * 2);
+                        short sample = (short)(_frame[i * 2] | (_frame[i * 2 + 1] << 8));
                         sum += (double)sample * sample;
                     }
                     double rms = samples == 0 ? 0 : Math.Sqrt(sum / samples) / 32768.0;
-                    SetLevel((float)Math.Min(1, rms * 4));
+                    SetLevel((float)Math.Min(1, rms * 4)); // 显示用：放大 4 倍，保持既有观感
+                    Recorder.OnAudioFrame(rms, bytes);     // 分段用：原始归一化 RMS，不做显示放大
 
                     // Reset 会把剩余缓冲区回调回来；停止标记避免在释放前重新入队。
                     // 计数：回调让“一个在途缓冲结束”；若成功重新入队则保持计数，
@@ -711,6 +772,9 @@ namespace VoxLeap
         public volatile bool Cancelled;
         public volatile HttpWebRequest CurrentRequest;
         public Action<string> OnPartial;
+        // 会话级延迟分解。挂在会话上，因此所有 provider 都能记录自己那一段，
+        // 无需改动 IStreamingAsrProvider 签名。只记阶段与计数，不记正文。
+        public LatencyTrace Trace;
 
         public void Abort()
         {
@@ -738,11 +802,13 @@ namespace VoxLeap
         {
             var result = new AsrResult();
             var sw = Stopwatch.StartNew();
+            LatencyTrace trace = session == null ? null : session.Trace;
             try
             {
                 byte[] wav = File.ReadAllBytes(wavPath);
+                if (trace != null) trace.Note("wavBytes", wav.Length);
                 IStreamingAsrProvider provider = CreateProvider(cfg);
-                return provider.Transcribe(cfg, PrepareAudio(cfg, wav), session);
+                return provider.Transcribe(cfg, PrepareAudio(cfg, wav, trace), session);
             }
             catch (WebException wex)
             {
@@ -765,6 +831,7 @@ namespace VoxLeap
             Stopwatch sw = Stopwatch.StartNew();
             var result = new AsrResult();
             HttpWebRequest req = null;
+            LatencyTrace trace = session == null ? null : session.Trace;
             try
             {
                 byte[] pcm = VoxleapCore.ExtractPcm(wav);
@@ -778,6 +845,14 @@ namespace VoxLeap
                 req.ContentType = "application/json";
                 req.Accept = "text/event-stream";
                 req.Headers["Authorization"] = "Bearer " + cfg.ApiKey;
+                // 关闭写缓冲有两个理由：
+                //  1) HttpWebRequest 默认会先把整个请求体缓冲在内存里、close 时才发——
+                //     这样"上传"与"服务端处理"在计时上无法区分。关闭后 Write 受真实网络
+                //     背压阻塞，上传耗时才可测（LatencyTrace.Connected/Uploaded）。
+                //  2) 顺带省掉一份请求体的内存副本：300s 录音的请求体约 12.8MB，
+                //     默认缓冲会再复制一份。
+                // 代价：请求不可被重定向/重鉴权后重放（本端点是固定 HTTPS POST，不重定向）。
+                req.AllowWriteStreamBuffering = false;
                 var tj = new StringBuilder();
                 tj.Append("{\"model\":\"").Append(VoxleapCore.EscapeJson(cfg.Model)).Append("\"");
                 // language 留空则省略该字段，由模型自动识别语种。
@@ -802,10 +877,21 @@ namespace VoxLeap
                     + tj.ToString() + ",\"format\":{\"type\":\"pcm\",\"codec\":\"pcm_s16le\",\"rate\":16000,\"bits\":16,\"channel\":1}}}}";
                 byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
                 req.ContentLength = bodyBytes.Length;
-                using (var rs = req.GetRequestStream()) { rs.Write(bodyBytes, 0, bodyBytes.Length); }
+                if (trace != null)
+                {
+                    trace.Note("reqBytes", bodyBytes.Length);
+                    trace.Mark(LatencyTrace.Prepared); // VAD + base64 + JSON 组装完成
+                }
+                using (var rs = req.GetRequestStream()) // 含 TCP + TLS 握手
+                {
+                    if (trace != null) trace.Mark(LatencyTrace.Connected);
+                    rs.Write(bodyBytes, 0, bodyBytes.Length); // 已关闭写缓冲，这里才是真实网络传输
+                }
+                if (trace != null) trace.Mark(LatencyTrace.Uploaded);
 
                 using (var resp = (HttpWebResponse)req.GetResponse())
                 {
+                    if (trace != null) trace.Mark(LatencyTrace.Ttfb); // 服务端已收全音频并开始响应
                     result.HttpStatus = (int)resp.StatusCode;
                     var deltas = new StringBuilder();
                     string finalText = null;
@@ -826,9 +912,12 @@ namespace VoxLeap
                             }
 
                             if (!hasText) continue;
+                            // Mark 只记首次，因此这里记的是"第一个带文本的事件"到达时间。
+                            if (trace != null) trace.Mark(LatencyTrace.FirstDelta);
                             if (type == "transcript.text.done")
                             {
                                 finalText = piece;
+                                if (trace != null) trace.Mark(LatencyTrace.Done);
                             }
                             else if (type == "transcript.text.delta")
                             {
@@ -841,6 +930,8 @@ namespace VoxLeap
                             }
                         }
                     }
+                    // 兜底：部分实现可能不发 done 事件，用流结束时间收尾（Mark 首次生效，不会覆盖）。
+                    if (trace != null) trace.Mark(LatencyTrace.Done);
                     result.Text = finalText != null ? finalText : deltas.ToString();
                     result.Ok = true;
                 }
@@ -861,11 +952,20 @@ namespace VoxLeap
             return result;
         }
 
-        private static byte[] PrepareAudio(Config cfg, byte[] wav)
+        private static byte[] PrepareAudio(Config cfg, byte[] wav, LatencyTrace trace)
         {
-            if (!cfg.EnableVad) return wav;
+            if (!cfg.EnableVad)
+            {
+                if (trace != null) trace.NoteText("vad", "关闭");
+                return wav;
+            }
             byte[] pcm = VoxleapCore.ExtractPcm(wav);
             byte[] trimmed = VoxleapCore.TrimSilencePcm(pcm, 16000, cfg.VadThreshold, cfg.VadPaddingMs);
+            if (trace != null)
+            {
+                trace.Note("vadInBytes", pcm == null ? 0 : pcm.Length);
+                trace.Note("vadOutBytes", trimmed == null ? 0 : trimmed.Length);
+            }
             if (trimmed.Length == 0) return wav;
             Log.Write("VAD: " + pcm.Length + " -> " + trimmed.Length + " bytes");
             return VoxleapCore.CreatePcmWav(trimmed, 16000);
@@ -2221,6 +2321,8 @@ namespace VoxLeap
         private uint _targetPid; // 录音开始时的目标进程 ID，注入前复核句柄是否被复用（P1：窗口身份校验）
         private bool _hotkeyWasDown;
         private AsrSession _asrSession;
+        // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
+        private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
         private DateTime _suppressHotkeyUntil; // 自动收尾（超时/keyup 丢失）后短暂抑制热键自动重复触发
 
@@ -2511,6 +2613,8 @@ namespace VoxLeap
                     _overlay.HideOverlay();
                     _toast.ShowToast("已取消，文字未保留");
                     Log.Write("取消看门狗兜底: 转写线程未在时限内返回");
+                    // 悬挂会话的延迟分解同样有用：能看出请求卡在哪一段。
+                    LogSessionTrace(session == null ? null : session.Trace);
                 }
             };
             _cancelWatchdog = timer;
@@ -2519,6 +2623,9 @@ namespace VoxLeap
 
         private void OnHoldStart()
         {
+            // 时间轴 0 点 = 用户按下热键的瞬间。因此 trace.At(Release) 即录音时长，
+            // 而「松手后 = 总时长 - 录音时长」就是用户真正在等的那段。
+            _trace = new LatencyTrace();
             try
             {
                 if (SettingsFormOpen())
@@ -2538,7 +2645,7 @@ namespace VoxLeap
                     Log.Write("跳过录音: 目标控件带密码样式");
                     return;
                 }
-                if (!Recorder.Start())
+                if (!Recorder.Start(_cfg.VadThreshold))
                 {
                     _toast.ShowToast("无法打开麦克风，检查录音设备");
                     return;
@@ -2564,6 +2671,9 @@ namespace VoxLeap
 
         private void OnHoldRelease()
         {
+            LatencyTrace trace = _trace;
+            // 松手 = 用户开始等待的起点。
+            if (trace != null) trace.Mark(LatencyTrace.Release);
             _overlay.HideOverlay();
             double elapsedMs = (DateTime.Now - _recordStart).TotalMilliseconds;
             if (elapsedMs < 400)
@@ -2582,9 +2692,16 @@ namespace VoxLeap
                 _hotkeyWasDown = false;
                 try { if (File.Exists(wav)) File.Delete(wav); } catch { }
                 _toast.ShowToast("录音保存失败，请重试");
+                if (trace != null)
+                {
+                    trace.NoteText("outcome", "保存失败");
+                    LogSessionTrace(trace);
+                }
                 return;
             }
+            if (trace != null) trace.Mark(LatencyTrace.Saved);
             var session = new AsrSession();
+            session.Trace = trace;
             session.OnPartial = delegate(string text)
             {
                 try
@@ -2655,6 +2772,14 @@ namespace VoxLeap
             {
                 try { if (File.Exists(wav)) File.Delete(wav); } catch { }
             }
+            if (session != null && session.Trace != null)
+            {
+                LatencyTrace trace = session.Trace;
+                trace.NoteText("outcome", res.Cancelled ? "已取消" : (res.Ok ? "ok" : "失败"));
+                trace.NoteText("status", res.HttpStatus > 0 ? res.HttpStatus.ToString() : "无HTTP状态");
+                trace.Note("chars", (res.Text ?? "").Length);
+                if (!res.Ok && !string.IsNullOrEmpty(res.Error)) trace.NoteText("error", res.Error);
+            }
             Log.Write("识别: ok=" + res.Ok + " cancelled=" + res.Cancelled + " status=" + res.HttpStatus + " 用时=" + res.LatencySeconds.ToString("0.00") + "s 字数=" + (res.Text ?? "").Length);
             FinishOnUi(res, session);
         }
@@ -2662,13 +2787,23 @@ namespace VoxLeap
         private void FinishOnUi(AsrResult res, AsrSession session)
         {
             IntPtr target = _target;
+            LatencyTrace trace = session == null ? null : session.Trace;
+            // 冻结"文本就绪"时刻的两个数字：审阅卡片打开后用户可能过很久才点写入，
+            // 那时 trace.PostReleaseMs() 已不是"等待识别"的时长，必须提前取值。
+            long readyMs = trace == null ? -1 : trace.PostReleaseMs();
+            string readySuffix = trace == null ? "" : trace.ToMetaSuffix();
             try
             {
                 _overlay.BeginInvoke((MethodInvoker)delegate
                 {
                     // 会话身份校验：看门狗已收尾或用户已开新会话时，过期回调整体丢弃，
                     // 防止旧请求返回后打掉新会话状态、把旧正文注入新目标。
-                    if (!object.ReferenceEquals(_asrSession, session)) return;
+                    if (!object.ReferenceEquals(_asrSession, session))
+                    {
+                        // 过期会话仍然记录其延迟分解（例如请求最终悬挂了多久），便于排障。
+                        LogSessionTrace(trace);
+                        return;
+                    }
                     _asrSession = null;
                     StopCancelWatchdog();
                     _hotkeyWasDown = false; // keyup 可能丢失，回 Idle 时复位去抖锁存。
@@ -2677,6 +2812,7 @@ namespace VoxLeap
                     {
                         _state = State.Idle;
                         _toast.ShowToast("已取消，文字未保留");
+                        LogSessionTrace(trace);
                         return;
                     }
                     string originalText = NormalizeCjkLatinSpacing(res.Text ?? "");
@@ -2691,17 +2827,30 @@ namespace VoxLeap
                         {
                             // 自动输入模式（用户主动开启）：跳过审阅，直接写入按下热键时捕获的目标。
                             _state = State.Idle;
-                            InjectText(text);
+                            try { InjectText(text, readyMs); }
+                            finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
+                            LogSessionTrace(trace);
                         }
                         else
                         {
-                            string meta = "原文保留 · " + _cfg.Model + " · 用时 " + res.LatencySeconds.ToString("0.0") + "s";
+                            string meta = "原文保留 · " + _cfg.Model;
                             if (!string.IsNullOrEmpty(res.OrganizedText))
                                 meta = "AI 整理 · 原文可恢复 · " + _cfg.OrganizerModel;
-                            var review = new ReviewForm(text, originalText, meta, delegate(string editedText) { InjectText(editedText); },
+                            if (readySuffix.Length > 0) meta = meta + " · " + readySuffix;
+                            var review = new ReviewForm(text, originalText, meta,
+                                delegate(string editedText)
+                                {
+                                    try { InjectText(editedText, -1); }
+                                    finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
+                                },
                                 delegate(string msg) { _toast.ShowToast(msg); });
                             _state = State.Reviewing;
-                            review.FormClosed += delegate { _state = State.Idle; };
+                            // 审阅会话在此收尾：此时注入耗时（若用户点了写入）已并入 trace。
+                            review.FormClosed += delegate
+                            {
+                                _state = State.Idle;
+                                LogSessionTrace(trace);
+                            };
                             Point p = ScreenLayout.BottomCenterOf(target, review.Width, review.Height, 24);
                             review.Location = p;
                             review.Show();
@@ -2712,6 +2861,7 @@ namespace VoxLeap
                         _state = State.Idle;
                         string err = res.Ok ? "未识别到内容" : res.Error;
                         _toast.ShowToast("识别失败：" + err);
+                        LogSessionTrace(trace);
                     }
                 });
             }
@@ -2720,7 +2870,15 @@ namespace VoxLeap
                 Log.Write("UI 回调失败: " + ex.Message);
                 _asrSession = null;
                 _state = State.Idle;
+                LogSessionTrace(trace);
             }
+        }
+
+        // 每个会话只写一行延迟分解（隐私约束：无转写正文，只有阶段耗时与计数）。
+        private static void LogSessionTrace(LatencyTrace trace)
+        {
+            if (trace == null) return;
+            try { Log.Write("延迟: " + trace.ToLogLine()); } catch { }
         }
 
         private void StopCancelWatchdog()
@@ -2769,8 +2927,11 @@ namespace VoxLeap
             return true;
         }
 
-        private void InjectText(string text)
+        // readyMs：从松开热键到"文本就绪"的毫秒数，只为自动输入的成功提示附上真实等待时间。
+        // 审阅路径传 -1：用户审阅了多久与识别延迟无关，混进来会得到一个无意义的巨大数字。
+        private void InjectText(string text, long readyMs)
         {
+            string waitSuffix = readyMs > 0 ? " · " + (readyMs / 1000.0).ToString("0.0") + "s" : "";
             try
             {
                 IntPtr target = _target;
@@ -2878,7 +3039,7 @@ namespace VoxLeap
                     uint sent2 = SendCtrlV();
                     if (sent2 == 4)
                     {
-                        _toast.ShowToastCentered("已输入 " + text.Length + " 字 · 剪贴板", target);
+                        _toast.ShowToastCentered("已输入 " + text.Length + " 字 · 剪贴板" + waitSuffix, target);
                         Log.Write("写入成功: " + text.Length + " 字, 路径=兜底剪贴板");
                         return;
                     }
@@ -2886,7 +3047,7 @@ namespace VoxLeap
                     Log.Write("写入失败: Ctrl+V 被拦截，内容已留在剪贴板");
                     return;
                 }
-                _toast.ShowToastCentered("已输入 " + text.Length + " 字", target);
+                _toast.ShowToastCentered("已输入 " + text.Length + " 字" + waitSuffix, target);
                 Log.Write("写入成功: " + text.Length + " 字, 路径=" + via);
             }
             catch (Exception ex)

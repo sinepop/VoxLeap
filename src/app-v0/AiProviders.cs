@@ -26,6 +26,7 @@ namespace VoxLeap
                 var result = new AsrResult();
                 var started = DateTime.UtcNow;
                 HttpWebRequest request = null;
+                LatencyTrace trace = session == null ? null : session.Trace;
                 try
                 {
                     string boundary = "----VoxLeapBoundary" + Guid.NewGuid().ToString("N");
@@ -42,11 +43,29 @@ namespace VoxLeap
                     request.ReadWriteTimeout = cfg.RequestTimeoutMs;
                     request.ContentType = "multipart/form-data; boundary=" + boundary;
                     request.Headers["Authorization"] = "Bearer " + cfg.ApiKey;
+                    // 同 StepFun 路径：关闭写缓冲，让上传耗时可测且省一份请求体副本。
+                    request.AllowWriteStreamBuffering = false;
                     byte[] body = BuildMultipart(boundary, cfg.Model, wav);
                     request.ContentLength = body.Length;
-                    using (Stream stream = request.GetRequestStream()) stream.Write(body, 0, body.Length);
+                    if (trace != null)
+                    {
+                        trace.Note("reqBytes", body.Length);
+                        trace.Mark(LatencyTrace.Prepared);
+                    }
+                    using (Stream stream = request.GetRequestStream())
+                    {
+                        if (trace != null) trace.Mark(LatencyTrace.Connected);
+                        stream.Write(body, 0, body.Length);
+                    }
+                    if (trace != null) trace.Mark(LatencyTrace.Uploaded);
                     using (var response = (HttpWebResponse)request.GetResponse())
                     {
+                        if (trace != null)
+                        {
+                            trace.Mark(LatencyTrace.Ttfb);
+                            trace.Mark(LatencyTrace.FirstDelta); // 非流式：响应到手即全部文本
+                            trace.Mark(LatencyTrace.Done);
+                        }
                         result.HttpStatus = (int)response.StatusCode;
                         string payload = ReadResponse(response);
                         Match match = Regex.Match(payload, "\"text\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
@@ -127,6 +146,7 @@ namespace VoxLeap
             if (!cfg.AiOrganize) return result;
             if (string.IsNullOrEmpty(original)) { result.Error = "原文为空"; return result; }
             HttpWebRequest request = null;
+            LatencyTrace trace = session == null ? null : session.Trace;
             try
             {
                 if (session != null && session.Cancelled) { result.Error = "已取消"; return result; }
@@ -149,6 +169,7 @@ namespace VoxLeap
                 using (Stream stream = request.GetRequestStream()) stream.Write(bytes, 0, bytes.Length);
                 using (var response = (HttpWebResponse)request.GetResponse())
                 {
+                    if (trace != null) trace.Mark(LatencyTrace.Organized);
                     string payload = ReadAll(response);
                     Match match = Regex.Match(payload, "\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
                     if (!match.Success) { result.Error = "整理响应里没有 choices.message.content"; return result; }
