@@ -171,6 +171,17 @@ namespace VoxLeap
                 {
                     if (trace != null) trace.Mark(LatencyTrace.Organized);
                     string payload = ReadAll(response);
+                    // 诊断：整理耗时与字数完全不成比例（20 字 5148ms，12 字 2061ms），怀疑是
+                    // 模型在生成思考 token，而这里是整段阻塞等待（stream=false，无 max_tokens，
+                    // 也没有任何推理开关），思考 token 全部要等完。
+                    // 只记录用量与长度，不记录正文（日志不得含完整转写正文）。
+                    Match inTok = Regex.Match(payload, "\"prompt_tokens\"\\s*:\\s*(\\d+)");
+                    Match outTok = Regex.Match(payload, "\"completion_tokens\"\\s*:\\s*(\\d+)");
+                    bool hasReasoning = payload.IndexOf("reasoning_content", StringComparison.Ordinal) >= 0;
+                    Log.Write("整理用量: 原文=" + original.Length + "字 输入token="
+                        + (inTok.Success ? inTok.Groups[1].Value : "?") + " 输出token="
+                        + (outTok.Success ? outTok.Groups[1].Value : "?") + " 推理字段="
+                        + (hasReasoning ? "有" : "无") + " 响应=" + payload.Length + "字节");
                     Match match = Regex.Match(payload, "\"content\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
                     if (!match.Success) { result.Error = "整理响应里没有 choices.message.content"; return result; }
                     result.Text = VoxleapCore.NormalizeCjkLatinSpacing(JsonUtil.Unescape(match.Groups[1].Value)).Trim();
