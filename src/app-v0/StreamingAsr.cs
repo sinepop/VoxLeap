@@ -148,8 +148,11 @@ namespace VoxLeap
         public int SegmentBytes { get { return _segmentBytes; } }
         public int Requests { get { return _requests; } }
 
-        // 按段序就绪的文本会交给它（在工作线程上调用，宿主负责真正注入）。
-        public Action<string> OnReadyText;
+        // 按段序就绪的文本会交给它（在工作线程上调用）。
+        // **当前无人设置它，这是故意的**：说话期间不再往输入框注入任何东西——实测在装有
+        // 中文输入法的输入框里会把字符送进输入法的拼写缓存而不是上屏，并卡死输入法。
+        // 现在分段结果只用于松手后拼出完整文本，由收尾路径一次性写入。
+        public Action<string> OnReadyText = null;
         private readonly object _injectGate = new object();
 
         // 已经往用户输入框里注入过文字。
