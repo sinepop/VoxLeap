@@ -53,8 +53,12 @@ namespace VoxLeap
         private int _autoStops;
         private bool _splitFired;           // 同一次静音游程只报一次分界
         private bool _endFired;             // 同一次静音游程只报一次收尾
-        private long _receivedBytes;
+        private long _receivedBytes;        // 收到的全部音频字节（含停机回收的真实音频）
+        private long _liveReceivedBytes;    // 只累计"直播"回调，用于与期望帧数比差
         private long _expectedBytes;
+        private long _flushBytes;           // 停机回收的字节数
+        private int _flushCallbacks;        // 停机回收的回调数
+        private int _zeroLiveCallbacks;     // 运行期收到 0 字节的回调数 —— 确定性的丢帧信号
         private readonly List<int> _silenceRuns = new List<int>();
 
         public SpeechSegmenter(int frameMs, double speechRms, int minSpeechMs, int splitSilenceMs, int endSilenceMs)
@@ -75,16 +79,36 @@ namespace VoxLeap
         public int Boundaries { get { return _boundaries; } }
         public int AutoStops { get { return _autoStops; } }
         public long ReceivedBytes { get { return _receivedBytes; } }
+        public long LiveReceivedBytes { get { return _liveReceivedBytes; } }
         public long ExpectedBytes { get { return _expectedBytes; } }
+        public int FlushCallbacks { get { return _flushCallbacks; } }
+        public int ZeroLiveCallbacks { get { return _zeroLiveCallbacks; } }
 
         public IList<int> SilenceRuns { get { return _silenceRuns; } }
 
         // 每帧上报 waveIn 实际交付的字节数，用于核对采样连续性（丢帧会直接毁掉流式识别）。
-        public void NoteAudioBytes(int bytesRecorded)
+        //
+        // live=false 表示这是停机时 waveInReset 把在途缓冲半满回收回来的回调。它携带的字节是
+        // 真实音频（必须计入 _receivedBytes，否则与 MCI 独立录到的字节数对不上），但它**不是
+        // 一个完整帧**：
+        //   - 按整帧计入期望字节，会凭空多出 3200 字节的差额，看起来像丢帧；
+        //   - 喂给 Feed 又会凭空多出 100ms 静音，把时长与静音游程一并撑大。
+        // 实机三次录音的差额恰好都等于"3 个半满缓冲"，正是这个原因，不是丢帧。所以停机回收
+        // 既不参与期望、也不参与事件，只单独计数上报。
+        public void NoteAudioBytes(int bytesRecorded, bool live)
         {
             if (bytesRecorded < 0) bytesRecorded = 0;
             _receivedBytes += bytesRecorded;
+            if (!live)
+            {
+                _flushCallbacks++;
+                _flushBytes += bytesRecorded;
+                return;
+            }
+            _liveReceivedBytes += bytesRecorded;
             _expectedBytes += (long)_frameMs * BytesPerMs;
+            // 运行期收到 0 字节：这才是不含糊的丢帧，必须能被日志直接看见。
+            if (bytesRecorded == 0) _zeroLiveCallbacks++;
         }
 
         // 非破坏性查询：此刻是否满足自动收尾条件。宿主每 100ms 轮询一次，因此这里不能改变
@@ -181,8 +205,13 @@ namespace VoxLeap
         {
             var sb = new StringBuilder();
             sb.Append("分段影子: 帧=").Append(_frames);
-            sb.Append(" 字节=").Append(_receivedBytes).Append('/').Append(_expectedBytes);
-            sb.Append(" 差=").Append(_receivedBytes - _expectedBytes);
+            // 字节=真实收到的音频总量（可与下一行 VAD 的输入字节数交叉核对：两条独立采集
+            // 路径应当一致，不一致才说明真的丢了音频）。直播/期望只管连续性与丢帧判定。
+            sb.Append(" 字节=").Append(_receivedBytes);
+            sb.Append(" 直播=").Append(_liveReceivedBytes).Append('/').Append(_expectedBytes);
+            sb.Append(" 差=").Append(_liveReceivedBytes - _expectedBytes);
+            sb.Append(" 停机回收=").Append(_flushCallbacks).Append("帧/").Append(_flushBytes).Append("字节");
+            sb.Append(" 零字节=").Append(_zeroLiveCallbacks);
             sb.Append(" 时长=").Append((_elapsedMs / 1000.0).ToString("0.0")).Append("s");
             sb.Append(" 说话=").Append((_speechMsTotal / 1000.0).ToString("0.0")).Append("s");
             sb.Append(" 起=").Append(_speechStarts);

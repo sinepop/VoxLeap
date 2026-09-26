@@ -142,11 +142,44 @@ internal static class SpeechSegmenterRunner
     private static void TestByteAccounting()
     {
         var seg = New();
-        for (int i = 0; i < 10; i++) seg.NoteAudioBytes(3200); // 每帧 100ms 应为 3200 字节
-        CheckEq("无丢帧时收发字节相等", seg.ReceivedBytes - seg.ExpectedBytes, 0);
-        seg.NoteAudioBytes(1600); // 一帧只交付一半 → 丢帧
-        CheckEq("丢帧时差值为负", seg.ReceivedBytes - seg.ExpectedBytes, -1600);
+        for (int i = 0; i < 10; i++) seg.NoteAudioBytes(3200, true); // 每帧 100ms 应为 3200 字节
+        CheckEq("无丢帧时直播收发字节相等", seg.LiveReceivedBytes - seg.ExpectedBytes, 0);
+        seg.NoteAudioBytes(1600, true); // 一帧只交付一半 → 丢帧
+        CheckEq("丢帧时差值为负", seg.LiveReceivedBytes - seg.ExpectedBytes, -1600);
         CheckEq("期望字节数按帧长推算", seg.ExpectedBytes, 11L * 100 * SpeechSegmenter.BytesPerMs);
+        CheckEq("残缺帧不算零字节丢帧", seg.ZeroLiveCallbacks, 0);
+
+        // 停机回收（live=false）：字节是真实音频要计入总量，但不能算作完整帧，
+        // 否则会凭空多出 3200 字节差额，把每次正常录音都误判成丢帧。
+        // 实机三次录音的差额恰好都是"3 个半满缓冲"，正是这个原因。
+        var stop = New();
+        for (int i = 0; i < 5; i++) { stop.NoteAudioBytes(3200, true); stop.Feed(Voiced); }
+        stop.NoteAudioBytes(1200, false);
+        stop.NoteAudioBytes(900, false);
+        stop.NoteAudioBytes(1038, false);
+        CheckEq("停机回收仍计入音频总量", stop.ReceivedBytes, 5L * 3200 + 3138);
+        CheckEq("停机回收不污染直播字节差", stop.LiveReceivedBytes - stop.ExpectedBytes, 0);
+        CheckEq("停机回收单独计数", stop.FlushCallbacks, 3);
+        CheckEq("停机回收不产生帧", stop.Frames, 5);
+
+        // 停机回收若被喂进 Feed，会凭空多出 300ms 静音，把静音游程一起撑大——
+        // 实机上就表现为"收尾阈值设 1200ms，日志却报出 1500ms 游程"。
+        var tail = New();
+        for (int i = 0; i < 3; i++) { tail.NoteAudioBytes(3200, true); tail.Feed(Voiced); }
+        for (int i = 0; i < 10; i++) { tail.NoteAudioBytes(3200, true); tail.Feed(Silent); }
+        CheckEq("直播静音游程为 1000ms", tail.SilenceRunMs, 1000);
+        tail.NoteAudioBytes(1200, false);
+        tail.NoteAudioBytes(900, false);
+        tail.NoteAudioBytes(1038, false);
+        CheckEq("停机回收不撑大静音游程", tail.SilenceRunMs, 1000);
+        CheckEq("停机回收不增加帧数", tail.Frames, 13);
+
+        // 运行期收到 0 字节：这才是不含糊的丢帧。
+        var drop = New();
+        for (int i = 0; i < 4; i++) drop.NoteAudioBytes(3200, true);
+        drop.NoteAudioBytes(0, true);
+        CheckEq("运行期零字节被计数", drop.ZeroLiveCallbacks, 1);
+        CheckEq("零字节让差变负", drop.LiveReceivedBytes - drop.ExpectedBytes, -3200);
     }
 
     private static void TestEndThresholdClamped()
@@ -246,13 +279,14 @@ internal static class SpeechSegmenterRunner
         Feed(seg, 10, Voiced, c);
         Feed(seg, 8, Silent, c);
         // NoteAudioBytes 是每帧一次的回调语义，必须逐帧上报（每次累加一帧的期望字节）。
-        for (int i = 0; i < 18; i++) seg.NoteAudioBytes(3200);
+        for (int i = 0; i < 18; i++) seg.NoteAudioBytes(3200, true);
         seg.Finish();
         string line = seg.ToLogLine();
         Check("摘要含帧数", line.IndexOf("帧=18") >= 0);
         Check("摘要含说话时长", line.IndexOf("说话=1.0s") >= 0);
         Check("摘要含段数", line.IndexOf("段=1") >= 0);
-        Check("摘要含字节核对", line.IndexOf("字节=57600/57600") >= 0);
+        Check("摘要含字节核对", line.IndexOf("字节=57600") >= 0 && line.IndexOf("直播=57600/57600") >= 0);
+        Check("摘要含停机回收与零字节计数", line.IndexOf("停机回收=0帧/0字节") >= 0 && line.IndexOf("零字节=0") >= 0);
         Check("摘要含尾段", line.IndexOf("尾段=0ms") >= 0);
         Check("摘要含阈值参数", line.IndexOf("分界=600ms") >= 0 && line.IndexOf("收尾=1200ms") >= 0);
     }

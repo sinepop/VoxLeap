@@ -434,13 +434,14 @@ namespace VoxLeap
 
         // 由 waveIn 回调线程逐帧调用（每 100ms 一次）。只做纯内存计算，不做磁盘或网络 I/O，
         // 避免在音频回调里引入阻塞。
-        private static void OnAudioFrame(double rmsRaw, int bytesRecorded)
+        // live=false 表示这是停机回收的半满缓冲：字节要记账，但不能当成一个完整帧。
+        private static void OnAudioFrame(double rmsRaw, int bytesRecorded, bool live)
         {
             lock (_segmenterGate)
             {
                 if (_segmenter == null) return;
-                _segmenter.NoteAudioBytes(bytesRecorded);
-                _segmenter.Feed(rmsRaw);
+                _segmenter.NoteAudioBytes(bytesRecorded, live);
+                if (live) _segmenter.Feed(rmsRaw);
             }
         }
 
@@ -754,7 +755,12 @@ namespace VoxLeap
                     }
                     double rms = samples == 0 ? 0 : Math.Sqrt(sum / samples) / 32768.0;
                     SetLevel((float)Math.Min(1, rms * 4)); // 显示用：放大 4 倍，保持既有观感
-                    Recorder.OnAudioFrame(rms, bytes);     // 分段用：原始归一化 RMS，不做显示放大
+                    // 判定这个回调是不是"直播帧"：
+                    //  - 满缓冲：无论是否正在停机，都是完整的一帧；
+                    //  - 残缺且正在停机：waveInReset 回收的在途半满缓冲，不是完整帧；
+                    //  - 残缺但仍在运行：异常情况，按整帧记账，让"差"变负把丢帧暴露出来。
+                    bool live = bytes >= BufferBytes || Thread.VolatileRead(ref _stopping) == 0;
+                    Recorder.OnAudioFrame(rms, bytes, live); // 分段用：原始归一化 RMS，不做显示放大
 
                     // Reset 会把剩余缓冲区回调回来；停止标记避免在释放前重新入队。
                     // 计数：回调让“一个在途缓冲结束”；若成功重新入队则保持计数，
@@ -1578,7 +1584,7 @@ namespace VoxLeap
         // 对抗审查 P1 安全闸：即使 MaxRecordMs=0，录音也不得无限持续（keyup 丢失/卡住场景）。
         // 10 分钟硬顶后自动转入转写（MaxDurationReached），避免麦克风静默常开。
         private static readonly int RecordSafeguardMs = 10 * 60 * 1000;
-        public Action MaxDurationReached; // 录音到上限时的回调（由宿主定义为转存并继续转写）
+        public Action<string> MaxDurationReached; // 需要收尾时的回调，参数是收尾原因（供日志区分）
         // 对抗审查 P1 键态探测：宿主注入“热键物理上是否仍按住”，用于 keyup 丢失（Alt+Tab/UAC/安全桌面/ RDP）自动收尾。
         public Func<bool> HoldKeyStillDown;
         // 静音自动停止：宿主注入"此刻是否该因静音而收尾"。返回 true 时走与录音上限/keyup 丢失
@@ -1729,12 +1735,12 @@ namespace VoxLeap
                 if (ShouldAutoStopOnSilence != null && ShouldAutoStopOnSilence())
                 {
                     _recording = false; // 防重入
-                    if (MaxDurationReached != null) MaxDurationReached();
+                    if (MaxDurationReached != null) MaxDurationReached("静音自动停止");
                 }
                 else if (totalSeconds * 1000L >= capMs)
                 {
                     _recording = false; // 防重入
-                    if (MaxDurationReached != null) MaxDurationReached();
+                    if (MaxDurationReached != null) MaxDurationReached("录音上限");
                 }
                 else if (HoldKeyStillDown != null && _holdKeyWasDownOnce)
                 {
@@ -1747,7 +1753,7 @@ namespace VoxLeap
                     {
                         _recording = false;
                         _holdKeyLiftedAt = DateTime.MinValue;
-                        if (MaxDurationReached != null) MaxDurationReached();
+                        if (MaxDurationReached != null) MaxDurationReached("热键松开丢失");
                     }
                 }
             }
@@ -2357,10 +2363,13 @@ namespace VoxLeap
             _cfg = Config.Load();
             _overlay = new OverlayForm();
             _overlay.MaxRecordMs = _cfg.MaxRecordMs;
-            _overlay.MaxDurationReached = delegate
+            _overlay.MaxDurationReached = delegate(string reason)
             {
-                // 自动收尾（录音上限/keyup 丢失兜底）后热键若仍被按住，auto-repeat 的 keydown
-                // 会在转写完成后误触发新一轮录音；抑制 1 秒，等用户实际松开再按才允许。
+                // 自动收尾（静音自动停止/录音上限/keyup 丢失兜底）后热键若仍被按住，auto-repeat
+                // 的 keydown 会在转写完成后误触发新一轮录音；抑制 1 秒，等用户实际松开再按才允许。
+                // 顺带把"到底是谁结束了这次录音"写进日志——先前三个原因共用一个无参回调，
+                // 日志里分不清是自动收尾还是松手，只能靠推断。
+                Log.Write("录音收尾: " + reason);
                 _suppressHotkeyUntil = DateTime.Now.AddSeconds(1);
                 OnHoldRelease();
             };
