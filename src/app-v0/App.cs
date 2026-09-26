@@ -1360,7 +1360,9 @@ namespace VoxLeap
     // GDI+ 抗锯齿后再和桌面合成。
     internal abstract class LayeredGlassForm : GlassForm
     {
-        private const int SurfaceInset = 10;
+        // 玻璃面相对窗口的内缩。protected 而非 private：录音态要用它算"胶囊宽度里
+        // 与字幕文本无关的那些边"（见 OverlayForm.RecCaptionChromeWidth）。
+        protected const int SurfaceInset = 10;
         private readonly System.Windows.Forms.Timer _fadeTimer;
         private int _layeredOpacity = 255;
         private int _fadeFromOpacity;
@@ -1674,11 +1676,14 @@ namespace VoxLeap
         private bool _busy;
         // 录音期实时字幕（只显示，绝不注入）。原始累计文本与"已经裁到放得下"的显示文本分开存：
         // 裁字要测量字体，只在字幕更新时做一次，而不是每帧（30fps）都做。
+        private readonly LiveCaptionAnim _liveAnim = new LiveCaptionAnim();
         private string _liveCaption = "";
         private string _liveCaptionDisplay = "";
-        // 本次录音是否已经为字幕让出一行。一旦让出就保持到下次 ShowRecording，
-        // 否则文本变长变短时浮层会在屏幕底部反复上下跳。
-        private bool _liveCaptionRow;
+        // 动画帧时钟（Environment.TickCount 毫秒）与"显示文本"缓存键。
+        // 缓存键能把每帧的逐字测量降到"只有字数或胶囊宽度真的变了"时才做一次。
+        private int _liveFrameAt;
+        private int _liveFitRevealed = -1;
+        private int _liveFitWidth = -1;
         private Font _liveCaptionFont;
         // 录音态布局：第一行（红点 + 时间码 + 声波）固定占用内容盒顶部 56px —— 这恰好是
         // 无字幕时 76px 窗口的内容盒全高（76 - 上下各 10 的内缩），所以第一行中轴仍是
@@ -1688,6 +1693,11 @@ namespace VoxLeap
         private const int RecCaptionRowHeight = 30;
         private const int RecCaptionLeftInset = 22;  // 与第一行的红点左缘对齐
         private const int RecCaptionRightInset = 20;
+        // 胶囊宽度里与字幕文本无关的那些边：两侧玻璃内缩（LayeredGlassForm.SurfaceInset）、
+        // 字幕左右内缩，再加 6px 量测余量——宽度用 GDI 的 TextRenderer 量、绘制走 GDI+ 的
+        // DrawString，两者字宽有细微差异，宁可少放一个字，也不能让最新吐出的字被裁掉。
+        private const int RecCaptionChromeWidth =
+            SurfaceInset * 2 + RecCaptionLeftInset + RecCaptionRightInset + 6;
         private readonly float[] _waveLevels = new float[5];
         private readonly float[] _levelHistory = new float[8];
         private int _historyIndex;
@@ -1770,11 +1780,14 @@ namespace VoxLeap
             _busyCaption = "";
             _liveCaption = "";        // 每次录音开始清空字幕，上一轮的字不许残留到新一轮
             _liveCaptionDisplay = "";
-            _liveCaptionRow = false;
+            _liveFitRevealed = -1;
+            _liveFitWidth = -1;
+            _liveAnim.Reset(WorkAreaWidthOf(targetWindow));
+            _liveFrameAt = Environment.TickCount;
             _busy = false;
             _busyTarget = targetWindow;
             ResetWave();
-            Size = new Size(256, 76);
+            Size = new Size(LiveCaptionAnim.BaseWidth, LiveCaptionAnim.BaseHeight);
             Location = ScreenLayout.BottomCenterOf(targetWindow, Width, Height, 28);
             UpdateText();
             _levelTimer.Start();
@@ -1819,16 +1832,20 @@ namespace VoxLeap
             text = text ?? "";
             if (_liveCaption == text) return;
             _liveCaption = text;
-            _liveCaptionDisplay = FitLiveCaption(text);
-            UpdateRecordingLayout();
-            if (Visible && IsHandleCreated) RefreshLayeredSurface();
+            _liveAnim.SetTextLength(text.Length);
+            // 这里只登记"全文有多长"，真正的推进交给 30fps 帧循环（UpdateLevel → AdvanceLiveCaption）：
+            // 字幕到达与动画解耦，一次到达一大段也不会让浮层瞬间长到位。
         }
 
         // 字幕只显示**结尾**若干字，理由与忙碌态的 GetBusyDisplayText 一致：用户是在看着字往外冒，
-        // 刚说出口的那一截才是新信息，前面说过的是已知内容；长句整段铺开在 236px 宽的内容盒里
-        // 也放不下。裁字用逐字测量而不是固定字数：字号、DPI、中英混排字宽都会变，而
+        // 刚说出口的那一截才是新信息，前面说过的是已知内容。
+        // 与忙碌态不同的是：录音胶囊会随说话变宽（见 AdvanceLiveCaption），"放不下"的门槛因此
+        // 一路后移，直到宽度到上限才在这里丢掉最旧的字。
+        // 裁字用逐字测量而不是固定字数：字号、DPI、中英混排字宽都会变，而
         // DrawLayeredText 的省略号是从**右侧**截的——固定字数一旦估大，被吃掉的就正好是
         // 最新吐出来的字，与"字幕"的目的相反。
+        // 输入是**已经吐出来的那部分**文本，不是全文：逐字展开还没吐到的字不该提前占位，
+        // 否则胶囊会先按全文长到位，字再慢慢往里填（与"随着说话变长"的观感正好相反）。
         private string FitLiveCaption(string text)
         {
             if (string.IsNullOrEmpty(text)) return "";
@@ -1868,13 +1885,51 @@ namespace VoxLeap
         //（文本变短就跟着缩的话，浮层会在屏幕底部来回跳动）。
         // 定位沿用 BottomCenterOf：底边距 28px 不变，所以浮层是**向上**长高——声波上移一行，
         // 字幕行落在原来那一带；这样底边永远钉在离屏幕底部 28px 处，符合"从屏幕底部出现"。
-        private void UpdateRecordingLayout()
+        // 以上是布局规则；高度与宽度都不是跳变，而是由下面这个每帧函数缓动推进
+        //（首次让出字幕行约 160ms 长满，宽度约 330ms 收敛，底边全程不动）。
+        // 每帧（30fps）推进字幕动画。顺序不能反：先按真实帧间隔吐出这一帧该显示的字，
+        // 再按**这些字**实测的宽度去定胶囊宽度目标；反过来会变成"框先长好、字在后面追"。
+        private void AdvanceLiveCaption()
         {
-            if (_liveCaptionRow) return;                             // 本次录音已经让出过一行，尺寸不再改
-            if (string.IsNullOrEmpty(_liveCaptionDisplay)) return;    // 还没有可显示的字：保持 256×76
-            _liveCaptionRow = true;
-            Size = new Size(256, 76 + RecCaptionRowHeight);
-            Location = ScreenLayout.BottomCenterOf(_busyTarget, Width, Height, 28);
+            // 帧间隔取真实时间差，不用假定的 33ms：Timer 会被系统节流，假定帧长会让动画在
+            // 卡顿时偷偷跑快。Environment.TickCount 是 int 毫秒，unchecked 相减天然处理回绕。
+            int now = Environment.TickCount;
+            int dt = unchecked(now - _liveFrameAt);
+            _liveFrameAt = now;
+            if (dt < 0 || dt > 500) dt = 0; // 挂起/卡顿之后不要一次性把动画跳完
+
+            if (_liveAnim.TextLength == 0) return; // 还没有任何字：保持 256×76
+            int revealed = _liveAnim.AdvanceReveal(dt);
+            int measured = 0;
+            if (revealed > 0)
+            {
+                string shown = revealed >= _liveCaption.Length
+                    ? _liveCaption
+                    : _liveCaption.Substring(0, revealed);
+                measured = TextRenderer.MeasureText(shown, LiveCaptionFont()).Width + RecCaptionChromeWidth;
+            }
+            _liveAnim.AdvanceLayout(dt, measured);
+        }
+
+        // 算出这一帧真正画出去的一行。缓存键是（已吐字数, 胶囊宽度）：两者都没变就沿用上一帧，
+        // 因为逐字测量字体不便宜，而 30fps 的大多数帧只有声波在动。
+        private void SyncLiveCaptionDisplay()
+        {
+            int revealed = _liveAnim.RevealedCount;
+            if (revealed > _liveCaption.Length) revealed = _liveCaption.Length;
+            if (revealed == _liveFitRevealed && Width == _liveFitWidth) return;
+            _liveFitRevealed = revealed;
+            _liveFitWidth = Width;
+            _liveCaptionDisplay = revealed <= 0 ? "" : FitLiveCaption(_liveCaption.Substring(0, revealed));
+        }
+
+        // 胶囊是水平居中的，而 BottomCenterOf 只居中、不钳制，所以宽度上限必须先被工作区宽度压一次。
+        private static int WorkAreaWidthOf(IntPtr targetWindow)
+        {
+            Screen screen = targetWindow != IntPtr.Zero
+                ? Screen.FromHandle(targetWindow)
+                : Screen.PrimaryScreen;
+            return screen.WorkingArea.Width;
         }
 
         public void HideOverlay()
@@ -1985,6 +2040,18 @@ namespace VoxLeap
                 if (Math.Abs(barTarget - _waveLevels[i]) < 0.005f) _waveLevels[i] = barTarget;
             }
             _historyIndex = (_historyIndex + 1) % _levelHistory.Length;
+
+            AdvanceLiveCaption();
+            // 尺寸变化用 SetBounds 一次到位（先改宽再改高会闪一帧错位），重绘交给 OnResize；
+            // 尺寸没变才在这里补一次，保证每帧恰好重绘一次。
+            int w = _liveAnim.Width;
+            int h = _liveAnim.Height;
+            if (w != Width || h != Height)
+            {
+                Point p = ScreenLayout.BottomCenterOf(_busyTarget, w, h, 28);
+                SetBounds(p.X, p.Y, w, h);
+                return;
+            }
             if (IsHandleCreated && Visible) RefreshLayeredSurface();
         }
 
@@ -2016,7 +2083,10 @@ namespace VoxLeap
                         false);
                 }
                 DrawBrandWave(g, surface.Right - 74.5f, cy);
-                if (_liveCaptionRow)
+                // 字幕行长到满高才画：这一行约 160ms 从 0 长到 30px，半高时画字会被玻璃边缘
+                // 切掉上下两头，看上去像文字从缝里挤出来。
+                SyncLiveCaptionDisplay();
+                if (_liveAnim.RowPixels >= RecCaptionRowHeight)
                 {
                     // 录音期字幕行：静音进行中的实时文字，只画在浮层上（本类不持有任何注入能力）。
                     DrawLayeredText(

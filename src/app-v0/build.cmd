@@ -20,7 +20,7 @@ if not exist "%OUTDIR%\settings.json" copy /Y "%~dp0settings.template.json" "%OU
   /win32icon:"%~dp0voxleap.ico" ^
   /out:"%OUTDIR%\VoxLeap.exe" ^
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Security.dll ^
-  "%~dp0App.cs" "%~dp0VoxleapCore.cs" "%~dp0SettingsCore.cs" "%~dp0SettingsForm.cs" "%~dp0AiProviders.cs" "%~dp0LatencyTrace.cs" "%~dp0SpeechSegmenter.cs" "%~dp0StreamingAsr.cs"
+  "%~dp0App.cs" "%~dp0VoxleapCore.cs" "%~dp0SettingsCore.cs" "%~dp0SettingsForm.cs" "%~dp0AiProviders.cs" "%~dp0LatencyTrace.cs" "%~dp0SpeechSegmenter.cs" "%~dp0StreamingAsr.cs" "%~dp0LiveCaptionAnim.cs"
 if errorlevel 1 (
     echo BUILD FAILED
     exit /b 1

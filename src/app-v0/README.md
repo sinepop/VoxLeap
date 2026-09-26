@@ -158,6 +158,19 @@ Protocol: JSON + base64 PCM + SSE
 
 `SpeechSegmenter` 是纯逻辑（可注入帧序列、可单测），同一个原语同时服务「静音自动停止」与「边说边送的分段边界」——两者本质都是"静音持续超过某个时长"。
 
+#### 录音期字幕的生长动画（2026-09-26 落地）
+
+胶囊原来写死 256×76：字幕只在第一次出现时把高度从 76 跳到 106 然后锁死，所以看上去就是"一小块不动"。现在它随说话生长：
+
+- **宽度随字长缓动增长，本次录音内只增不减，封顶 480px**（10pt 下约 31 个汉字一行）；上限先被工作区宽度压一次（`ClampMaxWidth` = 工作区宽 − 80，且不低于基础宽度 256）——浮层是水平居中的，而 `ScreenLayout.BottomCenterOf` 只居中、不钳制，不压就会顶出屏幕。
+- **字幕行高度缓动让位**：0 → 30px 约 160ms，长满才画字。半高时画字会被玻璃边缘切掉上下两头，看上去像文字从缝里挤出来。
+- **逐字展开（打字机感）**：基础 16 字/秒，按积压加速（上限 80 字/秒），所以一段十几个字一次到达也能追平，不会永远落在人说话后面。
+- **底边全程钉住**（离屏幕底 28px）：浮层因此是**向上**长高、向两侧对称变宽；第一行的红点与时间码贴左缘，五块声波贴右缘、跟着变宽往外移——变宽这个动作本身看得见。
+- **仍然只有一行**：到上限后丢最旧的字、前导 `…`（提词器语义：刚说出口的永远在最显眼处），不折行、无边框、无光标，避免变成输入框的样子。
+- 缓动**按时间**而不是按帧数（`int dt = unchecked(now - _liveFrameAt)`，Timer 被系统节流时速度不变）；尺寸变化用 `SetBounds` 一次到位，重绘交给 `OnResize`，保证每帧恰好重绘一次。
+
+动画的算术全在 `LiveCaptionAnim.cs`（纯逻辑，不依赖窗口 / 字体 / 线程），由 `LiveCaptionAnimTest` 离线验证不变量：宽度只增不减、绝不越上限、缓动不过冲且收敛、逐字展开不超调、积压追得上、收尾一次补齐、结果与帧率无关。
+
 ## 配置字段（settings.json）
 
 | 键 | 说明 |
@@ -205,6 +218,7 @@ build.cmd
 - `LatencyTrace.cs`
 - `SpeechSegmenter.cs`
 - `StreamingAsr.cs`
+- `LiveCaptionAnim.cs`
 
 ## 验证
 
@@ -231,6 +245,15 @@ LatencyTraceTest.exe
 csc /out:SpeechSegmenterTest.exe SpeechSegmenterTest.cs ..\..\src\app-v0\SpeechSegmenter.cs
 SpeechSegmenterTest.exe
 ```
+
+`tests/app-core-test/LiveCaptionAnimTest.cs` 覆盖录音期字幕动画的纯算术（无窗口、无字体、无线程依赖）：复位回 256×76、无字时尺寸一动不动、宽度只增不减（中途文本变短也不缩）、宽度目标封顶且**越界即判失败**、上限被工作区宽度压低、缓动不过冲且收敛到整数目标、结果与帧率无关（30fps / 20fps / 单帧 150ms 三者一致）、逐字展开单调且不超文本长度、积压越大吐得越快且 50 字能在 3.3 秒内追平、字幕行单调长满 30px、收尾立刻补齐。
+
+```cmd
+csc /out:LiveCaptionAnimTest.exe LiveCaptionAnimTest.cs ..\..\src\app-v0\LiveCaptionAnim.cs
+LiveCaptionAnimTest.exe
+```
+
+> **跑测试前必须先确认 `csc` 成功。** `csc` 编译失败时**不会**覆盖已存在的 `*Test.exe`，直接运行看到的是上一轮的绿灯（2026-09-26 又踩过一次：`StreamingAsrTest` / `SettingsCoreTest` 依赖 `App.cs` 里的 `Config` / `AsrSession` / `AsrResult`，只带各自的核心源文件编译会 `CS0246`）。这两个测试必须连同全部源文件编译，并用 `/main:` 指定入口，否则还会撞上 `App.cs` 自己的 `Main`；`SettingsCoreTest` 在 `VoxLeap` 命名空间内，要写成 `/main:VoxLeap.SettingsCoreTest`。
 
 ## 已知限制
 
