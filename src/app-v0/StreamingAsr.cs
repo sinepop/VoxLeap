@@ -96,6 +96,28 @@ namespace VoxLeap
             }
         }
 
+        // 只读的"按段序就绪"文本：从第 0 段起、连续已结算的那一串拼接。**不动任何游标**。
+        //
+        // 存在的唯一理由是浮层字幕：字幕要按段序实时显示，但它绝不能走 TakeReadyText——
+        // 那条路径会推进 _released 并写入 _releasedText，于是 HasInjected 变成真。一旦为真，
+        // TranscribeWorker 里"流式不可信就回退整段上传"的判定（App.cs: res == null && !HasInjected）
+        // 就会失效：分段失败时明明什么都没进输入框，却会跳过整段回退，用户这次录音直接丢字。
+        // 所以显示用途单开一个只读观察口，账本状态一个字节都不改。
+        public string PeekReadyText()
+        {
+            lock (_gate)
+            {
+                if (_failures.Count > 0) return null;
+                var sb = new StringBuilder();
+                for (int i = 0; i < _texts.Count; i++)
+                {
+                    if (_texts[i] == null) break; // 遇到未结算的段立刻停：后面的段不能插到前面显示
+                    sb.Append(_texts[i]);
+                }
+                return sb.ToString();
+            }
+        }
+
         // 按段序拼接。**只要有一段失败、或还有段没结算，就返回 null**——调用方必须回退
         // 整段上传，绝不能把残缺文本交给用户。这是整个流式方案的正确性底线。
         // 注意"没结算"不等于"失败"：如果只检查失败，中间缺一段时会拼出一句读不通的话。
@@ -152,7 +174,17 @@ namespace VoxLeap
         // **当前无人设置它，这是故意的**：说话期间不再往输入框注入任何东西——实测在装有
         // 中文输入法的输入框里会把字符送进输入法的拼写缓存而不是上屏，并卡死输入法。
         // 现在分段结果只用于松手后拼出完整文本，由收尾路径一次性写入。
+        // 注意：显示字幕也**不要**改用它，见下方 OnDisplayText。这个字段必须保持为 null。
         public Action<string> OnReadyText = null;
+
+        // 浮层字幕专用：把按段序就绪的**累计**文本交给宿主显示（在工作线程上调用）。
+        // 它与 OnReadyText 是两条不能合并的路径：
+        //   1. 它只读账本（PeekReadyText），不推进"已释放"游标，所以 HasInjected 恒为 false，
+        //      收尾时"流式不可信就回退整段上传"的判定不会被"显示过字幕"带偏；
+        //   2. 它的异常只被吞掉，不会被记成段失败——PumpReadyText 里 OnReadyText 的异常会走
+        //      NoteFailure，那会让整次流式的 Stitch 返回 null，等于一次真实的识别结果作废。
+        // 宿主收到的是累计文本（不是增量），因此重复显示同一串是幂等的。
+        public Action<string> OnDisplayText = null;
         private readonly object _injectGate = new object();
 
         // 已经往用户输入框里注入过文字。
@@ -169,6 +201,7 @@ namespace VoxLeap
         // 整体串行化，避免两个段的完成回调交错着往输入框里写。
         private void PumpReadyText()
         {
+            NotifyDisplay();
             Action<string> sink = OnReadyText;
             if (sink == null) return;
             lock (_injectGate)
@@ -178,6 +211,20 @@ namespace VoxLeap
                 try { sink(ready); }
                 catch (Exception ex) { _ledger.NoteFailure(_ledger.Released, "注入失败: " + ex.Message); }
             }
+        }
+
+        // 纯显示通知（浮层字幕）：只读账本、吞掉一切异常，绝不参与分段结算与收尾判定。
+        // 放在 OnReadyText 之前：显示与注入互不影响，谁在跑都不该拖住另一个。
+        private void NotifyDisplay()
+        {
+            Action<string> display = OnDisplayText;
+            if (display == null) return;
+            string ready;
+            try { ready = _ledger.PeekReadyText(); }
+            catch { return; }
+            if (string.IsNullOrEmpty(ready)) return;
+            try { display(ready); }
+            catch { } // 显示失败（例如浮层已销毁）不得影响识别结果
         }
 
         public void Dispatch(byte[] pcm)

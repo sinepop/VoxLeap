@@ -1672,6 +1672,22 @@ namespace VoxLeap
         private string _elapsedText = "";
         private IntPtr _busyTarget = IntPtr.Zero;
         private bool _busy;
+        // 录音期实时字幕（只显示，绝不注入）。原始累计文本与"已经裁到放得下"的显示文本分开存：
+        // 裁字要测量字体，只在字幕更新时做一次，而不是每帧（30fps）都做。
+        private string _liveCaption = "";
+        private string _liveCaptionDisplay = "";
+        // 本次录音是否已经为字幕让出一行。一旦让出就保持到下次 ShowRecording，
+        // 否则文本变长变短时浮层会在屏幕底部反复上下跳。
+        private bool _liveCaptionRow;
+        private Font _liveCaptionFont;
+        // 录音态布局：第一行（红点 + 时间码 + 声波）固定占用内容盒顶部 56px —— 这恰好是
+        // 无字幕时 76px 窗口的内容盒全高（76 - 上下各 10 的内缩），所以第一行中轴仍是
+        // surface.Top + 28，与改动前的 surface.Top + surface.Height / 2f 逐像素相同；
+        // 有字幕时才在这 56px 下面再加一行，而不是把两行一起居中（那会把声波压到字幕上）。
+        private const int RecRowHeight = 56;
+        private const int RecCaptionRowHeight = 30;
+        private const int RecCaptionLeftInset = 22;  // 与第一行的红点左缘对齐
+        private const int RecCaptionRightInset = 20;
         private readonly float[] _waveLevels = new float[5];
         private readonly float[] _levelHistory = new float[8];
         private int _historyIndex;
@@ -1731,6 +1747,11 @@ namespace VoxLeap
                 _timer.Dispose();
                 _levelTimer.Stop();
                 _levelTimer.Dispose();
+                if (_liveCaptionFont != null)
+                {
+                    _liveCaptionFont.Dispose();
+                    _liveCaptionFont = null;
+                }
             }
             base.Dispose(disposing);
         }
@@ -1747,6 +1768,9 @@ namespace VoxLeap
             _holdKeyWasDownOnce = true; // 录音开始即认为热键处于按下态，供 keyup 丢失检测
             _holdKeyLiftedAt = DateTime.MinValue;
             _busyCaption = "";
+            _liveCaption = "";        // 每次录音开始清空字幕，上一轮的字不许残留到新一轮
+            _liveCaptionDisplay = "";
+            _liveCaptionRow = false;
             _busy = false;
             _busyTarget = targetWindow;
             ResetWave();
@@ -1779,6 +1803,78 @@ namespace VoxLeap
             _busyCaption = text;
             UpdateBusyLayout();
             if (Visible && IsHandleCreated) RefreshLayeredSurface();
+        }
+
+        // 录音期实时字幕：把流式分段吐出来的文字画在浮层上，**只显示、不注入**。
+        //
+        // 为什么另开一条路径而不是复用 SetBusyCaption：忙碌态是另一套尺寸——
+        // UpdateBusyLayout 按文本测量宽度（26+31+10+文本宽+26）并把高度改成 68，而录音态是
+        // 钉死的 256×76、声波居中于 56px 内容盒。若在 _busy == false 时调 UpdateBusyLayout，
+        // 录音态的浮层尺寸会被字幕文本长度牵着走，声波和红点当场错位。
+        public void SetLiveCaption(string text)
+        {
+            // 只有"正在录音且还没进收尾"时才画字幕：收尾（_busy）与等待态走原有 SetBusyCaption，
+            // 这里的迟到封送不得改尺寸、也不得覆盖收尾字幕。
+            if (!_recording || _busy) return;
+            text = text ?? "";
+            if (_liveCaption == text) return;
+            _liveCaption = text;
+            _liveCaptionDisplay = FitLiveCaption(text);
+            UpdateRecordingLayout();
+            if (Visible && IsHandleCreated) RefreshLayeredSurface();
+        }
+
+        // 字幕只显示**结尾**若干字，理由与忙碌态的 GetBusyDisplayText 一致：用户是在看着字往外冒，
+        // 刚说出口的那一截才是新信息，前面说过的是已知内容；长句整段铺开在 236px 宽的内容盒里
+        // 也放不下。裁字用逐字测量而不是固定字数：字号、DPI、中英混排字宽都会变，而
+        // DrawLayeredText 的省略号是从**右侧**截的——固定字数一旦估大，被吃掉的就正好是
+        // 最新吐出来的字，与"字幕"的目的相反。
+        private string FitLiveCaption(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            Font font = LiveCaptionFont();
+            // 再留 6px 余量：这里用 GDI 的 TextRenderer 量，绘制走 GDI+ 的 DrawString，
+            // 两者字宽有细微差异；宁可少显示一个字，也不能让 GDI+ 从右边裁掉最新的字。
+            int available = SurfaceBounds.Width - RecCaptionLeftInset - RecCaptionRightInset - 6;
+            if (available < 24) available = 24;
+            string body = text;
+            bool trimmed = false;
+            const int maxChars = 60; // 先砍到 60 字再逐字测量，避免超长文本无谓空转
+            if (body.Length > maxChars)
+            {
+                body = body.Substring(body.Length - maxChars);
+                trimmed = true;
+            }
+            while (body.Length > 0
+                && TextRenderer.MeasureText(trimmed ? "…" + body : body, font).Width > available)
+            {
+                body = body.Substring(1); // 从最旧的一侧丢，永远保住刚说出口的字
+                trimmed = true;
+            }
+            if (body.Length == 0) return "";
+            return trimmed ? "…" + body : body;
+        }
+
+        private Font LiveCaptionFont()
+        {
+            // 比正文（12pt）小一档，让一行能多放几个字；10pt 在 96dpi 下约 13.3px，
+            // 仍满足项目规范里"关键正文不小于 12px"的要求。缓存复用，避免每帧 new Font。
+            if (_liveCaptionFont == null)
+                _liveCaptionFont = new Font("Microsoft YaHei UI", 10f, FontStyle.Regular);
+            return _liveCaptionFont;
+        }
+
+        // 录音期布局：只在真的出现了可显示字幕之后才长高一行，并且本次录音内不再缩回
+        //（文本变短就跟着缩的话，浮层会在屏幕底部来回跳动）。
+        // 定位沿用 BottomCenterOf：底边距 28px 不变，所以浮层是**向上**长高——声波上移一行，
+        // 字幕行落在原来那一带；这样底边永远钉在离屏幕底部 28px 处，符合"从屏幕底部出现"。
+        private void UpdateRecordingLayout()
+        {
+            if (_liveCaptionRow) return;                             // 本次录音已经让出过一行，尺寸不再改
+            if (string.IsNullOrEmpty(_liveCaptionDisplay)) return;    // 还没有可显示的字：保持 256×76
+            _liveCaptionRow = true;
+            Size = new Size(256, 76 + RecCaptionRowHeight);
+            Location = ScreenLayout.BottomCenterOf(_busyTarget, Width, Height, 28);
         }
 
         public void HideOverlay()
@@ -1898,22 +1994,43 @@ namespace VoxLeap
             if (_recording)
             {
                 // 录音棚语言：● + 1/10 秒时间码 + 声波。红点是真实录音状态。
-                float cy = surface.Top + surface.Height / 2f;
+                // 第一行钉在内容盒顶部 56px 内：56 / 2 = 28，与改动前的 surface.Height / 2f
+                // 逐像素相同（无字幕时 surface.Height 就是 56）；只有让出了字幕行之后，
+                // 浮层才比原来高 30px，而第一行仍待在它原来的顶部位置、不跟着一起居中。
+                float cy = surface.Top + RecRowHeight / 2f;
                 using (var dot = new SolidBrush(Color.FromArgb(255, 69, 58)))
                 {
                     g.FillEllipse(dot, surface.Left + 22, cy - 3.5f, 7, 7);
                 }
                 using (var timerFont = new Font("Consolas", 12f, FontStyle.Bold))
                 {
+                    // 时间码的包围盒必须钉在 56px 的第一行内：DrawLayeredText 是垂直居中的，
+                    // 若沿用 surface.Height，让出字幕行后时间码会独自掉到字幕行上去，
+                    // 而红点和声波还在第一行。无字幕时 56 == surface.Height，与改动前一致。
                     DrawLayeredText(
                         g,
                         _elapsedText,
                         timerFont,
                         Color.FromArgb(225, 242, 245, 247),
-                        new RectangleF(surface.Left + 37, surface.Top, 56, surface.Height),
+                        new RectangleF(surface.Left + 37, surface.Top, 56, RecRowHeight),
                         false);
                 }
                 DrawBrandWave(g, surface.Right - 74.5f, cy);
+                if (_liveCaptionRow)
+                {
+                    // 录音期字幕行：静音进行中的实时文字，只画在浮层上（本类不持有任何注入能力）。
+                    DrawLayeredText(
+                        g,
+                        _liveCaptionDisplay,
+                        LiveCaptionFont(),
+                        Color.FromArgb(196, 242, 245, 247),
+                        new RectangleF(
+                            surface.Left + RecCaptionLeftInset,
+                            surface.Top + RecRowHeight,
+                            surface.Width - RecCaptionLeftInset - RecCaptionRightInset,
+                            RecCaptionRowHeight),
+                        false);
+                }
             }
             else
             {
@@ -2828,6 +2945,12 @@ namespace VoxLeap
                     //
                     // 现在分段结果只用来在松手后拼出完整文本，由收尾路径一次性写入——那时热键
                     // 已经松开，纯键盘注入即可，不需要伪造修饰键，也没有 Ctrl+字符 的问题。
+                    //
+                    // 录音期字幕走 OnDisplayText（浮层显示，绝不注入）：它只读账本、按段序吐
+                    // 累计文本给浮层。**不能**改用 OnReadyText 来显示——那个回调会推进账本的
+                    // "已释放"游标、把 HasInjected 置真，于是 TranscribeWorker 里"流式不可信就
+                    // 回退整段上传"的判定失效（分段失败时不再回退），用户这次录音会静默丢字。
+                    runner.OnDisplayText = delegate(string text) { OnStreamDisplayText(runner, text); };
                     _streamRunner = runner;
                 }
                 else
@@ -2845,6 +2968,32 @@ namespace VoxLeap
                 try { _overlay.HideOverlay(); } catch { }
                 Log.Write("开始录音失败: " + ex.Message);
             }
+        }
+
+        // 录音期浮层字幕：把流式分段吐出来的文字画到浮层上。
+        //
+        // 这是全链路唯一"边说边显示"的入口，且**只显示**：不调用 InjectText / SendInput /
+        // SendModifier，不碰任何输入框。曾经在这里做过"说话期间注入"，实测在装有中文输入法的
+        // 输入框里会把字符送进输入法的拼写缓存而不是上屏，候选框乱跳并卡死输入法
+        // （详见 OnHoldStart 里的注释）。那个教训只约束"注入"，不约束"在浮层上画字"。
+        private void OnStreamDisplayText(StreamingSegmentRunner runner, string text)
+        {
+            try
+            {
+                // 在工作线程上被调用，必须封送到 UI 线程再动浮层。
+                _overlay.BeginInvoke((MethodInvoker)delegate
+                {
+                    try
+                    {
+                        // 会话身份校验：已经收尾（_streamRunner 置 null）或已经开了新录音时，
+                        // 上一会话迟到的那串字绝不能画到新会话的浮层上。
+                        if (!object.ReferenceEquals(_streamRunner, runner)) return;
+                        _overlay.SetLiveCaption(text);
+                    }
+                    catch { }
+                });
+            }
+            catch { } // 浮层句柄未创建/已销毁：显示失败不得向上抛，更不得影响分段结算
         }
 
         private void OnHoldRelease()
@@ -2947,14 +3096,19 @@ namespace VoxLeap
             try
             {
                 res = stream == null ? null : CollectStreamedTranscript(stream);
-                // 已经注入过内容就**不能**再回退整段：否则输入框里先有半截流式文字、
-                // 回退路径又在后面追加整段，变成重复内容。宁可这次没有结果，也不能写坏输入框。
-                if (res == null && (stream == null || !stream.HasInjected)) res = AsrClient.Transcribe(_cfg, wav, session);
+                // 这里**不能**用 HasInjected 把门（曾经就是那样，是个真缺陷）。
+                // 说话期间早已不再注入任何东西，但账本"释放"文本时仍会把 HasInjected 置真
+                // （TakeReadyText 会推进 _released、写入 _releasedText，PumpReadyText 是被
+                // DrainReadyText 主动调用的）。于是流式一旦不可信就会跳过整段回退——输入框里
+                // 明明是空的，用户却收到"输入框内已有部分内容"，整句录音直接丢掉。
+                // 实机 2026-09-26 17:07:58 已发生过一次（识别 ok=False 字数=0）。
+                // 现在说话期间不注入 ⇒ 回退不可能造成重复，所以无条件允许回退。
+                if (res == null) res = AsrClient.Transcribe(_cfg, wav, session);
                 if (res == null)
                 {
                     res = new AsrResult();
-                    res.Error = "流式识别中断，输入框内已有部分内容，请检查";
-                    Log.Write("流式分段中断且已注入过内容：跳过整段回退，避免重复");
+                    res.Error = "流式识别中断，整段回退也失败，请重试";
+                    Log.Write("流式分段中断，且整段回退也失败：本次无结果");
                 }
                 // 说明：这里**不再**在说话期间往输入框注入任何东西。
                 // 曾经用过"伪造修饰键抬起 + 注入 + 补回按下"，实测在装有中文输入法的输入框里
