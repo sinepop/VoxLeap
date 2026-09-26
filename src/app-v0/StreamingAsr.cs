@@ -63,8 +63,32 @@ namespace VoxLeap
         public int Dispatched { get { lock (_gate) return _dispatched; } }
         public int Settled { get { lock (_gate) return _settled; } }
         public int EmptySegments { get { lock (_gate) return _empty; } }
+        public int Released { get { lock (_gate) return _released; } }
         public bool AllSettled { get { lock (_gate) return _settled >= _dispatched; } }
         public bool AnyFailed { get { lock (_gate) return _failures.Count > 0; } }
+
+        // 按段序交出**本次可以安全注入**的新文本。
+        //
+        // 分段完成顺序与段序无关（各段长短不同、服务端耗时也不同），所以绝不能"谁先回来就
+        // 先注入谁"——那会往用户输入框里写出一句乱序的话。这里只交出从游标开始、连续已结算
+        // 的那一串，遇到第一个未结算的段就立刻停住。
+        //
+        // 返回 null 表示"这次流式已经注定要回退，不要再注入任何东西"；
+        // 返回空串表示"暂时没有新内容"；两者含义不同，调用方必须区分。
+        public string TakeReadyText()
+        {
+            lock (_gate)
+            {
+                if (_failures.Count > 0) return null;
+                var sb = new StringBuilder();
+                while (_released < _texts.Count && _texts[_released] != null)
+                {
+                    sb.Append(_texts[_released]);
+                    _released++;
+                }
+                return sb.ToString();
+            }
+        }
 
         // 按段序拼接。**只要有一段失败、或还有段没结算，就返回 null**——调用方必须回退
         // 整段上传，绝不能把残缺文本交给用户。这是整个流式方案的正确性底线。

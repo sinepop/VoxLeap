@@ -30,6 +30,8 @@ internal static class StreamingAsrTest
         TestFailureBlocksStitch();
         TestUnsettledIsNotComplete();
         TestEmptySegmentSettles();
+        TestOrderedRelease();
+        TestFailureStopsRelease();
         Console.WriteLine("----");
         Console.WriteLine("passed=" + _passed + " failed=" + _failed);
         return _failed == 0 ? 0 : 1;
@@ -91,5 +93,40 @@ internal static class StreamingAsrTest
         CheckEq("无语音段不贡献文本", "有字", l.Stitch());
         CheckEq("无语音段计数", 1, l.EmptySegments);
         Check("无语音段不算失败", !l.AnyFailed);
+    }
+
+    // 渐进注入：完成顺序与段序无关，所以必须按段序放出。
+    // 若写成"谁先回来先注入谁"，用户输入框里会出现乱序的句子。
+    private static void TestOrderedRelease()
+    {
+        var l = new SegmentLedger();
+        int a = l.Dispatch();
+        int b = l.Dispatch();
+        int c = l.Dispatch();
+        CheckEq("尚无结算时放出空串", "", l.TakeReadyText());
+        l.NoteText(b, "乙"); // 第 2 段先回来
+        CheckEq("前面的段未结算则按住不放", "", l.TakeReadyText());
+        l.NoteText(a, "甲");
+        CheckEq("前两段就绪即按序一起放出", "甲乙", l.TakeReadyText());
+        CheckEq("已放出的段不重复放出", "", l.TakeReadyText());
+        l.NoteText(c, "丙");
+        CheckEq("后续段就绪再放出", "丙", l.TakeReadyText());
+        CheckEq("已放段数", 3, l.Released);
+        CheckEq("放出顺序与拼接结果一致", "甲乙丙", l.Stitch());
+    }
+
+    // 一旦有段失败，整次流式作废：此后不允许再往用户输入框注入任何东西，
+    // 否则用户框里会残留半截文字，而回退路径又会在其后追加整段——变成重复内容。
+    private static void TestFailureStopsRelease()
+    {
+        var l = new SegmentLedger();
+        int a = l.Dispatch();
+        int b = l.Dispatch();
+        l.NoteText(a, "甲");
+        CheckEq("失败前可正常放出", "甲", l.TakeReadyText());
+        l.NoteFailure(b, "HTTP 500");
+        Check("失败后 TakeReadyText 返回 null", l.TakeReadyText() == null);
+        Check("失败后 Stitch 返回 null", l.Stitch() == null);
+        CheckEq("已放出的段数不回退", 1, l.Released);
     }
 }
