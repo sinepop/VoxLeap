@@ -19,6 +19,9 @@ namespace VoxLeap
         private int _settled;
         private int _empty;
         private int _released;
+        // 已经真正注入到用户输入框里的那串字。收尾替换时要拿它逐字比对，
+        // 确认框里那段确实是我们的，才敢动。
+        private readonly StringBuilder _releasedText = new StringBuilder();
 
         // 派发时先占位，保证段号与按键顺序一致。
         public int Dispatch()
@@ -65,6 +68,7 @@ namespace VoxLeap
         public int Settled { get { lock (_gate) return _settled; } }
         public int EmptySegments { get { lock (_gate) return _empty; } }
         public int Released { get { lock (_gate) return _released; } }
+        public string ReleasedText { get { lock (_gate) return _releasedText.ToString(); } }
         public bool AllSettled { get { lock (_gate) return _settled >= _dispatched; } }
         public bool AnyFailed { get { lock (_gate) return _failures.Count > 0; } }
 
@@ -87,6 +91,7 @@ namespace VoxLeap
                     sb.Append(_texts[_released]);
                     _released++;
                 }
+                _releasedText.Append(sb);
                 return sb.ToString();
             }
         }

@@ -2453,6 +2453,8 @@ namespace VoxLeap
         // 收尾逻辑跑在另一个方法（UI 线程的完成回调）里，拿不到 TranscribeWorker 的局部
         // 变量，所以用字段传递：它决定收尾还能不能写入（写入就会重复）。
         private volatile bool _streamInjected;
+        // 真正注入进输入框的那串原文。收尾时拿它逐字校验后才敢替换（见 ReplaceInjected）。
+        private volatile string _streamInjectedRaw;
         // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
         private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
@@ -2810,6 +2812,7 @@ namespace VoxLeap
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
                 _streamInjected = false;
+                _streamInjectedRaw = null;
                 // 边说边送会话：默认关闭时为 null，整条流式链路完全不存在。
                 if (_cfg.StreamingSegments)
                 {
@@ -2942,6 +2945,7 @@ namespace VoxLeap
                     Log.Write("流式分段中断且已注入过内容：跳过整段回退，避免重复");
                 }
                 _streamInjected = stream != null && stream.HasInjected;
+                _streamInjectedRaw = _streamInjected ? stream.Ledger.ReleasedText : null;
                 if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
                 {
                     ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();
@@ -3026,7 +3030,20 @@ namespace VoxLeap
                     {
                         if (!string.IsNullOrEmpty(res.OrganizeError))
                             _toast.ShowToast("AI 整理失败，已使用原文");
-                        if (_cfg.AutoInsert)
+                        // 边说边跳字：原文已经在输入框里了，**输入框本身就是审阅面**，
+                        // 不再弹审阅卡片。有整理版就把框里那段原文校验后换掉，没有就保持原文。
+                        if (_streamInjected)
+                        {
+                            _state = State.Idle;
+                            if (!string.IsNullOrEmpty(res.OrganizedText) && text != _streamInjectedRaw)
+                            {
+                                try { ReplaceInjected(_streamInjectedRaw, text); }
+                                catch (Exception ex) { Log.Write("替换整理版失败: " + ex.Message); }
+                                finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
+                            }
+                            LogSessionTrace(trace);
+                        }
+                        else if (_cfg.AutoInsert)
                         {
                             // 自动输入模式（用户主动开启）：跳过审阅，直接写入按下热键时捕获的目标。
                             // 但边说边跳字已经写过一遍原文了，这里再写就是在原文后面追加整段——
@@ -3149,6 +3166,99 @@ namespace VoxLeap
 
         // readyMs：从松开热键到"文本就绪"的毫秒数，只为自动输入的成功提示附上真实等待时间。
         // 审阅路径传 -1：用户审阅了多久与识别延迟无关，混进来会得到一个无意义的巨大数字。
+        // 按住 held 键，连按 count 次 tapKey，最后松开 held。整体一次 SendInput 发出。
+        private static void SendHoldTap(int held, int tapKey, int count)
+        {
+            try
+            {
+                var inputs = new List<Native.INPUT>();
+                if (held != 0) inputs.Add(VkInput((ushort)held, 0));
+                for (int i = 0; i < count; i++)
+                {
+                    inputs.Add(VkInput((ushort)tapKey, 0));
+                    inputs.Add(VkInput((ushort)tapKey, Native.KEYEVENTF_KEYUP));
+                }
+                if (held != 0) inputs.Add(VkInput((ushort)held, Native.KEYEVENTF_KEYUP));
+                Native.SendInput((uint)inputs.Count, inputs.ToArray(), Marshal.SizeOf(typeof(Native.INPUT)));
+            }
+            catch { }
+        }
+
+        private static void SendCtrlC()
+        {
+            try
+            {
+                Native.INPUT[] inputs = new Native.INPUT[4];
+                inputs[0] = VkInput(0x11, 0);                                  // Ctrl 按下
+                inputs[1] = VkInput((ushort)'C', 0);
+                inputs[2] = VkInput((ushort)'C', Native.KEYEVENTF_KEYUP);
+                inputs[3] = VkInput(0x11, Native.KEYEVENTF_KEYUP);             // Ctrl 松开
+                Native.SendInput(4, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+            }
+            catch { }
+        }
+
+        // 校验后替换：把输入框里"我们边说边注入的那段原文"换成整理版。
+        //
+        // 为什么必须校验：从注入到整理完成中间隔了好几秒，用户完全可能已经自己改过错、
+        // 挪过光标、或者切走了窗口。盲选 N 个字符去替换，删掉的可能根本不是我们的字。
+        // 所以流程是：往回选 N 个字符 → Ctrl+C 回读 → 与我们确实注入过的字符串**逐字比对**，
+        // 一致才替换；不一致则**一个字都不动**，只提示。
+        //
+        // 前置硬条件：目标窗口必须仍是前台窗口。按键事件发给的是前台窗口而不是我们记下的
+        // _target，不确认这一点就可能把 Ctrl+C 和文字送到别的程序里。
+        private bool ReplaceInjected(string injected, string replacement)
+        {
+            if (string.IsNullOrEmpty(injected) || string.IsNullOrEmpty(replacement)) return false;
+            if (injected == replacement) return false;
+            if (injected.Length > 400) { Log.Write("替换放弃: 原文字数过多 " + injected.Length); return false; }
+
+            IntPtr target = _target;
+            if (!Native.IsWindow(target)) { _toast.ShowToast("目标窗口已关闭，未替换"); return false; }
+            if (Native.GetForegroundWindow() != target)
+            {
+                _toast.ShowToast("已切走窗口，未自动替换（原文保留在输入框）");
+                Log.Write("替换拒绝: 目标已非前台窗口，原文 " + injected.Length + " 字");
+                return false;
+            }
+
+            string saved = null;
+            try { if (Clipboard.ContainsText()) saved = Clipboard.GetText(); } catch { }
+            try
+            {
+                try { Clipboard.Clear(); } catch { }
+                SendHoldTap(Native.VK_SHIFT, 0x25, injected.Length); // Shift+左选 × N（0x25 = VK_LEFT）
+                Thread.Sleep(50);
+                SendCtrlC();
+                string back = null;
+                for (int i = 0; i < 15 && back == null; i++)
+                {
+                    Thread.Sleep(20);
+                    try { if (Clipboard.ContainsText()) back = Clipboard.GetText(); } catch { }
+                }
+                if (back != injected)
+                {
+                    // 不一致 ⇒ 一个字都不动，并先按一次右方向键把选择收起来，光标回到原处。
+                    SendHoldTap(0, 0x27, 1); // 0x27 = VK_RIGHT
+                    Log.Write("替换放弃: 回读不一致（读到 " + (back == null ? "空" : back.Length.ToString()) + " 字，期望 " + injected.Length + " 字）");
+                    _toast.ShowToast("输入框内容已变化，未自动替换（原文保留）");
+                    return false;
+                }
+                InjectText(replacement, -1); // 有选择时注入即覆盖
+                Log.Write("已替换为整理版: " + injected.Length + " 字 → " + replacement.Length + " 字");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Write("替换异常: " + ex.Message);
+                return false;
+            }
+            finally
+            {
+                try { if (!string.IsNullOrEmpty(saved)) Clipboard.SetText(saved); else Clipboard.Clear(); } catch { }
+            }
+        }
+
         // 热键是右 Ctrl / 右 Alt / 右 Shift 时返回该修饰键的 VK。
         // Caps Lock 不是修饰键（按住它不影响其它按键的含义），返回 -1。
         private static int HotkeyModifierVk(Config cfg)
