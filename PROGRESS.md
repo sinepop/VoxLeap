@@ -25,12 +25,60 @@
 - **已推送（2026-09-24）**：`177f994 feat: 增加延迟分解与实时分段埋点`（9 文件，+1193/−22）由用户在本地终端推送成功；`ls-remote` 与 GitHub API 双向核对 sha 一致，本地/远端 0 领先 0 落后。
 - **已推送（2026-09-07）**：`https://github.com/sinepop/VoxLeap`（PUBLIC，main）。脱敏（移除本机用户名/绝对路径/UNC/vault 路径，删除跟踪的 VoxLeap.exe 并加入 .gitignore）后 force-push 覆盖远端；旧 test 分支已删。**releases 已重建**：删除旧 v0.1.0/v0.2.0 tag（其提交含系统默认名 `Administrator`）后，用脱敏 main 重新打 tag；v0.2.0 用 Windows csc 重新编译的脱敏源码 exe（含全部 9-07 修复）+ zip，v0.1.0 复用已确认干净的旧 zip。旧资产备份于 `~/Downloads/voxleap-release-backup-20260907/`。仓库现已完全无个人标识，后续变更 `git push origin main` 即可。
 - **本轮进展（2026-09-26 续，16:59–17:37，11 个提交）**：L2「边说边跳字」做完并在真机试用 → **真机事故**（往装着中文输入法的输入框里注入，字符进的是输入法的未上屏拼写缓存、候选框乱跳，最终把输入法卡死，用户只能重启输入法）→ **撤回说话期间的键盘注入**（`f9578a7`），改为"录音期只在浮层显示实时字幕、松手后一次性写入最终文本"；`7c915ab` 补上录音期浮层字幕，并拆掉一道会**静默丢掉整句**的整段回退门（`17:07:58` 已实机发生过一次）。详见下方「2026-09-26（续 2）」。
+- **发布状态（2026-09-26 22:54）**：GitHub Release **v0.3.1** 已发布 —— tag 指向 `6c2e197`（= 推送后的 main 头），资产 `VoxLeap-v0.3.1-windows.zip`（74550 字节，SHA-256 `CA215FB9…B7D9`，已下载回本地复算一致）；v0.3.0 原样保留。首页 `README.md` 已补下载入口与 v0.3.1 现状，`INDEX.md` 文件索引重修。本地 main 与 origin/main 同步。
 - **运行版状态（2026-09-26 22:39 重启后核对）**：新构建 236544 字节（22:39:41）已同时落在 `%LOCALAPPDATA%\VoxLeap\VoxLeap.exe` 与运行目录 `D:\好用的工具\agent\VoxLeap-v0.3.0-windows\VoxLeap.exe`，两处 **SHA-256 一致**（`1732AB06…5819`）；上一版重命名为 `VoxLeap.exe.20260926-2239.bak` 保留。**进程 PID 3304 启动于 22:39:43**，晚于 exe 写入时间，日志记 `22:39:43.255 启动: model=stepaudio-2.5-asr hasKey=True hook=True` ⇒ **新构建已生效**。**用户已实测确认淡入（"都渐入渐出都挺好的"）**，且日志显示松手收尾链路两次完整走通（22:45）；仍未验：收尾"保留那行字"的视觉、封顶位置、高 DPI 裁字。
 - **本轮进展（2026-09-26 续 7，22:39 部署）**：① 用日志确认"分段降到 1.8s"生效且无副作用（批次间隔 2.6s → 1.4s，`失败=0`，跨段切词未造成可见错字）；② 按"还是有点硬"加了**最新那个字淡入 140ms + 微上浮 2px**，只单独画本行最后一个字；③ 顺带把 GDI+ 定位坑（`MeasureString` 多算尾部空白，差 3~13px）用逐像素脚本钉死，只有 `MeasureCharacterRanges` + 旁白补偿能对上。单测 49 → **57 项**。详见下方「（续 7）」。
 - **推送状态（2026-09-26 18:07 核对）**：本地 `main` 领先 `origin/main` **17 个提交**（今天 16:25–17:51 的全部提交，含收尾的 `9055a32 docs:`），仍受下方环境限制，需用户在本机终端 `git push origin main`。
 - **整理延迟的实测判定（2026-09-26）**：流式开启后松手后的等待几乎全是 AI 整理（93%～96%）；`输出token` 随输入字数近似同比例增长（91～892，约 8～11 token/字），据此**推断思考没有被关掉**。另外 `68cdfde` 用来推断"整理从未生效"的字数证据，经本会话核对**不成立**（同一时段存在 125→95 这类明显变化），详见「2026-09-26（续 2）」第五节。
 
 <!-- pi:current:end -->
+
+## 2026-09-26（续 8）：发布 v0.3.1（打包 + GitHub Release）+ 首页改版
+
+### 用户指示
+
+「更新 GitHub 链接页的内容，然后把最新的程序打包，上传 GitHub。」版本号由用户选定为**新建 v0.3.1**（v0.3.0 保留不动）。
+
+### 一、首页与索引改版
+
+- `README.md`（GitHub 首页）：原来只写到「Phase 0 + 浏览器原型」，**没有任何下载入口**。补上：下载与现状（v0.3.1 表格）、v0.3.0 之后的两条变化（边说边出字 / 字幕按说话速率铺开 + 最新字淡入）、正确性底线与隐私说明；文档索引补 `docs/09` 与 `PROGRESS`/`TODO`/`INDEX` 入口。
+- `INDEX.md`：一句话现状里的「当前阶段 = 浏览器原型 + ASR 基准评测 + 视觉方向重构」已不成立，改为**可交付的是运行版 v0.3.1**；文件索引自动区按真实清单重修（`src/app-v0/` 由 7 项改为 13 项并逐文件写职责、`tests/app-core-test` 记 6 项、`assets/` 只剩 `brand/`）。**注意**：负责生成该区的 `build_index.py` 并不在仓库里，这次是手工对齐 —— 脚本缺失本身是一笔文档债。
+
+### 二、发布包（VoxLeap-v0.3.1-windows.zip）
+
+与 v0.3.0 同一布局：**平铺 4 个文件**，不含 `settings.json`、`voxleap.log`、API Key 与任何 `.bak`。
+
+| 文件 | 大小 | 说明 |
+|---|---|---|
+| `VoxLeap.exe` | 236544 | 与运行目录、`%LOCALAPPDATA%` 两处 SHA-256 一致的同一个构建（`1732AB06…5819`） |
+| `README.md` | 9070 | 包内用户说明（本次修掉过时内容，见下） |
+| `INSTALL.txt` | 1224 | 安装与注意事项（版本号与流式说明更新） |
+| `settings.template.json` | 686 | 从 `src/app-v0/` 同步，补上 `autoStopOnSilence` / `autoStopSilenceMs` / `streamingSegments` |
+
+包内 `README.md` 这次修掉了三处**已经不成立**的说法：
+
+1. 标题还写着「Personal v0.1」，改为与包一致的 v0.3.1；
+2. 「转写中显示 SSE `delta` 的增量字幕」—— 现在是**边说边送的分段字幕**（录音期就在出字）；
+3. 已知限制里「StepFun 仍是整段上传后 SSE 回放，并非真正的音频分片流式」—— 现在就**有**分片（软 1.2s / 硬 1.8s 上限切段分别送识别），整段上传只是任一段失败时的回退路径。
+
+另外补上三个配置项、更新构建文件清单与六个测试入口（含 `/main:` 与「先删旧 exe」那条坑）。
+
+- ZIP 74550 字节，SHA-256 `CA215FB99CE67AD4D4C4E54108EAAC37ECC287CC5A7B426CA7C45AE362E2B7D9`。
+- 把已发布的资产下载回来复算哈希，与本地一致 ⇒ 上传无损。
+
+### 三、GitHub Release
+
+- `gh release create v0.3.1 --target main <zip>`，标题 `VoxLeap v0.3.1（边说边出的实时字幕）`，现为 Latest，v0.3.0 原样保留。
+- tag `v0.3.1` 指向 `6c2e197`（= 推送后的 main 头）。
+- 说明文档沿用 v0.3.0 的三段式：本次更新 / 下载与校验（含 ZIP SHA-256）/ 已知限制。
+
+### 四、环境事实：本会话里 `git push` 走不了凭据助手
+
+推送 24 个提交时实测（下次直接用可行路径，别再试 GCM）：
+
+- `git push` 直接失败：`exit 128` **且没有任何错误输出**。`GIT_TRACE=1` 显示 trace 停在 `run-command: 'gh auth git-credential get'` 之后就没有下文 —— 卡在「git 让外部凭据助手取凭据」这一步。`credential.helper=manager`（GCM）与临时换成 `!gh auth git-credential` 都是同样结果。
+- **已排除的原因**：网络没问题（`gh release download` 能拉包、公开仓库 `git ls-remote origin` 能列 refs）；原生到原生的管道没问题（`cmd /c 'echo hi | findstr hi'` 正常）。
+- **可用路径**：`gh auth token` 重定向到临时文件（cmd 重定向，不经 pwsh 管道）→ 在 pwsh 里拼 `Authorization: Basic base64("x-access-token:" + token)` → `git -c credential.helper= -c http.extraHeader=… push`，一次成功（`177f994..6c2e197  main -> main`）。token 不进命令行文本、不打印、用完立即删临时文件。
 
 ## 2026-09-26（续 7）：分段降到 1.8s 的实机结果 + 最新那个字淡入（去"硬"）
 
