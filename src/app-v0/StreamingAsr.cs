@@ -18,6 +18,7 @@ namespace VoxLeap
         private int _dispatched;
         private int _settled;
         private int _empty;
+        private int _released;
 
         // 派发时先占位，保证段号与按键顺序一致。
         public int Dispatch()
