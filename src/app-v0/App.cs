@@ -437,10 +437,15 @@ namespace VoxLeap
         private static readonly object _segmenterGate = new object();
 
         // ---- 边说边送：分段 PCM 累积 ------------------------------------------
-        // 单段软上限 5 秒。连续说话没有停顿时分段边界不会触发，靠它保证"字一直在出"；
-        // 到达软上限后再等第一个静音帧才切，避免切在词中间。12 秒硬上限兜底。
-        private const int SegSoftCloseBytes = 16000 * 2 * 5;
-        private const int SegHardCloseBytes = 16000 * 2 * 12;
+        // 单段软上限 2 秒、硬上限 3 秒。
+        //
+        // 为什么不是 5 秒：实机日志显示，用户说话的自然停顿大量落在 100~500ms，远低于
+        // 600ms 的分段阈值，而整句通常只有 1~5 秒——两个条件都不满足，于是每次录音只切出
+        // 一段（日志里全是"派发=1"），而这一段只能等松手才发得出去，"边说边出字"就永远
+        // 不会发生。所以兜底必须由**音频时长**决定，而不是由静音时长决定：到 2 秒后遇到
+        // 第一个静音帧就切（尽量不切在词中间），连续说话不停也最迟 3 秒硬切一次。
+        private const int SegSoftCloseBytes = 16000 * 2 * 2;
+        private const int SegHardCloseBytes = 16000 * 2 * 3;
         private static byte[] _segBuf;
         private static int _segLen;
         private static double _speechRms;
@@ -2912,6 +2917,9 @@ namespace VoxLeap
         private AsrResult CollectStreamedTranscript(StreamingSegmentRunner stream)
         {
             bool settled = stream.WaitAll(_cfg.RequestTimeoutMs);
+            // 先补注入剩下的、再读"注入过没有"：否则会读到过期标志，把"已经注入过"
+            // 误判成"没注入过"，进而多弹一张审阅卡片（用户一点写入就重复）。
+            stream.DrainReadyText();
             string text = settled ? stream.Ledger.Stitch() : null;
             Log.Write(stream.Ledger.ToLogLine()
                 + " 分段音频=" + stream.SegmentBytes + "字节 已请求=" + stream.Requests

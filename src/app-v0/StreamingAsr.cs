@@ -155,7 +155,11 @@ namespace VoxLeap
         // 已经往用户输入框里注入过文字。
         // 一旦为真就**绝不能**再走整段回退——否则框里会先有半截流式内容，
         // 回退路径又在后面追加整段，变成重复内容。
-        public bool HasInjected { get { return _ledger.Released > 0; } }
+        //
+        // 判据必须是"确实注入过**非空**文字"，不能是"释放过段数"：无语音段也会被释放
+        // （文本为空），按 Released>0 判断会把"什么都没注入"误判成"已注入过"，
+        // 于是该回退时不回退、去掉重复保护、还会多弹一张卡片。实机日志里已经发生过。
+        public bool HasInjected { get { return _ledger.ReleasedText.Length > 0; } }
 
         // 每有一段结算后调用：把按段序就绪的新文本取出来交给宿主注入。
         // TakeReadyText 返回 null 表示整次流式已作废，此后不再注入任何东西。
@@ -187,6 +191,12 @@ namespace VoxLeap
                 _ledger.NoteFailure(index, ex.Message);
             }
         }
+
+        // 等所有段结算之后、读 HasInjected/ReleasedText 之前，**必须**先调它一次。
+        // 原因：AllSettled 是在 NoteText 内部置真的，等待方可能先于 PumpReadyText 返回，
+        // 那样读到的就是过期标志——"已经注入过"会被误判成"没注入过"，于是多弹一张审阅
+        // 卡片，用户一点写入就重复。这一调用是幂等的（没有新内容时 TakeReadyText 返回空串）。
+        public void DrainReadyText() { PumpReadyText(); }
 
         private void Send(int index, byte[] pcm)
         {
