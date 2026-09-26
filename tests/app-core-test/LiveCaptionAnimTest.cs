@@ -5,8 +5,9 @@ using VoxLeap;
 //
 // 为什么单独测它：分层窗口的动画本身没法在测试里跑（要真窗口、要 30fps），但它依赖的
 // 算术全是可离线验证的不变量 —— 胶囊宽度只增不减、绝不超过上限、缓动不过冲且收敛、
-// 逐字展开不超调且积压时追得上、收尾一次补齐、结果与帧率无关。
-// 这些一旦破了，用户看到的就是浮层在屏幕底部来回缩、或者字吐到一半停住。
+// 逐字展开按到达速率铺开（不再"吐一阵停一阵"）且滞后有界、积压时追得上、收尾一次补齐、
+// 结果与帧率无关。这些一旦破了，用户看到的就是浮层在屏幕底部来回缩、字一个个弹出来、
+// 或者字吐到一半停住。
 internal static class LiveCaptionAnimTest
 {
     private static int _passed;
@@ -35,6 +36,9 @@ internal static class LiveCaptionAnimTest
         TestWidthEasesWithoutOvershoot();
         TestWidthIndependentOfFrameRate();
         TestRevealMonotonicAndNoOvershoot();
+        TestRevealPacedByArrivalRate();
+        TestArrivalRateGuards();
+        TestPacingLagStaysBounded();
         TestRevealCatchesUpWithBacklog();
         TestRowOnlyGrows();
         TestCompleteRevealFillsInstantly();
@@ -98,7 +102,7 @@ internal static class LiveCaptionAnimTest
         var a = new LiveCaptionAnim();
         a.Reset(1920);
         CheckEq("1920 工作区的宽度上限", 480, a.MaxWidth);
-        a.SetTextLength(400); // 400 字，远超一行
+        a.SetTextLength(400, 1000); // 400 字，远超一行
         for (int f = 0; f < 120; f++)
         {
             a.AdvanceReveal(33);
@@ -148,12 +152,13 @@ internal static class LiveCaptionAnimTest
         Check("缓动确实在动（不是一步到位）", a.Width > 256 && a.Width < 480);
     }
 
-    // 逐字展开：单调、不超调、绝对不超过文本长度。
+    // 逐字展开：单调、不超调、绝对不超过文本长度；而且**不再一口气吐光**。
+    // 这条以前断言"40 帧吐完 10 字"，那正是被用户否掉的"一个一个弹出来"：10 字 0.42 秒吐完。
     private static void TestRevealMonotonicAndNoOvershoot()
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(10);
+        a.SetTextLength(10, 1000);
         int last = 0;
         bool monotonic = true;
         bool overshoot = false;
@@ -166,18 +171,88 @@ internal static class LiveCaptionAnimTest
         }
         Check("已吐字数单调不减", monotonic);
         Check("已吐字数不超文本长度", !overshoot);
-        CheckEq("最终吐完", 10, a.RevealedCount);
+        Check("1320ms 内没有一口气吐光 10 字", last < 10);
+        for (int f = 0; f < 80; f++) a.AdvanceReveal(33);
+        CheckEq("最终一定吐完", 10, a.RevealedCount);
+    }
+
+    // 按到达速率铺开（2026-09-26 实机反馈："一个一个弹出来"+"过一段时间跳一段"）。
+    // 用实测节拍构造两批：每 2.6 秒到 8 字。要点是字被**摊开**吐，且速率估计确实建起来了。
+    private static void TestRevealPacedByArrivalRate()
+    {
+        var a = new LiveCaptionAnim();
+        a.Reset(1920);
+        int t = 1000;
+        a.SetTextLength(8, t); // 第一批 8 字
+        for (int f = 0; f < 18; f++) { a.AdvanceReveal(33); t += 33; } // 约 600ms
+        Check("第一段 600ms 内吐不出 4 个字以上（不再是 0.42 秒吐光）", a.RevealedCount <= 4);
+
+        while (t < 3600) { a.AdvanceReveal(33); t += 33; } // 推进到第二批该到的时刻
+        CheckEq("两批之间把第一批吐完", 8, a.RevealedCount);
+
+        a.SetTextLength(16, t); // 第二批又 8 字（累计 16）⇒ 间隔约 2.6 秒，据此估计速率
+        Check("按到达间隔建立起速率估计", Math.Abs(a.RatePerSecond - 8.0 * 1000.0 / (t - 1000)) < 0.01);
+        Check("速率估计落在常人语速量级（2~6 字/秒）", a.RatePerSecond >= 2.0 && a.RatePerSecond <= 6.0);
+
+        for (int f = 0; f < 30; f++) a.AdvanceReveal(33); // 约 1 秒
+        Check("第二批 1 秒内仍在慢慢吐（不是又一次吐光）", a.RevealedCount < 16);
+    }
+
+    // 速率估计的护栏：同一批被拆成两次到达（间隔过小）、或中间长时间没人说话（间隔过大），
+    // 都不许污染估计 —— 否则"铺开"会被一次抖动带偏，字要么卡住、要么又变成一口气吐光。
+    private static void TestArrivalRateGuards()
+    {
+        var small = new LiveCaptionAnim();
+        small.Reset(1920);
+        small.SetTextLength(5, 1000);
+        small.SetTextLength(6, 1100); // 间隔 100ms < 300ms：不参与估计
+        CheckEq("过小间隔不参与速率估计", 0.0, small.RatePerSecond);
+
+        var big = new LiveCaptionAnim();
+        big.Reset(1920);
+        big.SetTextLength(5, 1000);
+        big.SetTextLength(6, 21000); // 间隔 20s > 8s：不参与估计
+        CheckEq("过大间隔不参与速率估计", 0.0, big.RatePerSecond);
+
+        var grow = new LiveCaptionAnim();
+        grow.Reset(1920);
+        grow.SetTextLength(3, 1000);
+        grow.SetTextLength(8, 2000); // 间隔 1s、到 5 字 ⇒ 5 字/秒
+        Check("正常间隔建立估计", grow.RatePerSecond > 0.0);
+    }
+
+    // "铺开"不等于"永远落后"：真实节拍下连续 10 批，滞后必须有界。
+    // 松手时只会 CompleteReveal 补最后那几个字，滞后若是无界的，用户就会看到字幕越落越远。
+    private static void TestPacingLagStaysBounded()
+    {
+        var a = new LiveCaptionAnim();
+        a.Reset(1920);
+        int t = 1000;
+        int total = 0;
+        int maxBacklog = 0;
+        for (int batch = 0; batch < 10; batch++)
+        {
+            total += 8;
+            a.SetTextLength(total, t);
+            for (int f = 0; f < 79; f++) { a.AdvanceReveal(33); t += 33; } // 约 2.6 秒
+            int backlog = total - a.RevealedCount;
+            if (backlog > maxBacklog) maxBacklog = backlog;
+        }
+        Check("10 批之间最大滞后不超过一批", maxBacklog <= 8);
+        Check("没有越落越远", total - a.RevealedCount <= 8);
     }
 
     // 一次到达一大段时必须靠积压加速追得上，否则字永远落在人说话后面。
+    // 注意时限：积压越大越快（上限 45 字/秒），但积压回落到阈值以内后**故意**回到铺开速率，
+    // 所以 50 字不是 1 秒吐完，而是约 4.6 秒吐完（5 秒是留了余量的上界）。
     private static void TestRevealCatchesUpWithBacklog()
     {
         var small = new LiveCaptionAnim();
         small.Reset(1920);
-        small.SetTextLength(5);
+        small.SetTextLength(5, 1000);
         var big = new LiveCaptionAnim();
         big.Reset(1920);
-        big.SetTextLength(50);
+        big.SetTextLength(50, 1000);
         for (int f = 0; f < 10; f++)
         {
             small.AdvanceReveal(33);
@@ -186,11 +261,11 @@ internal static class LiveCaptionAnimTest
         Check("积压越大吐得越快", big.RevealedCount > small.RevealedCount);
 
         bool caughtUp = false;
-        for (int f = 0; f < 100 && !caughtUp; f++)
+        for (int f = 0; f < 160 && !caughtUp; f++)
         {
             caughtUp = big.AdvanceReveal(33) >= 50;
         }
-        Check("50 字积压能在 3.3 秒内追平", caughtUp);
+        Check("50 字积压能在 5 秒内追平", caughtUp);
     }
 
     // 字幕行只在有字要吐之后才开始长，且本次录音内只增不减。
@@ -198,7 +273,7 @@ internal static class LiveCaptionAnimTest
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(20);
+        a.SetTextLength(20, 1000);
         CheckEq("未开始时长 0 像素", 0, a.RowPixels);
         int last = 0;
         bool monotonic = true;
@@ -219,7 +294,7 @@ internal static class LiveCaptionAnimTest
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(30);
+        a.SetTextLength(30, 1000);
         a.AdvanceReveal(33); // 让字幕行开始
         a.AdvanceLayout(33, 300);
         a.CompleteReveal();

@@ -1804,6 +1804,10 @@ namespace VoxLeap
             _busyCaption = "";
             _busy = true;
             _busyTarget = targetWindow;
+            // 收尾态没有 30fps 帧循环了（_levelTimer 已停），按到达速率铺开所欠的那几个字必须在这里
+            // 一次补齐，否则滞后会永远留在屏幕上。宽度**不**跳到位（那一下看得见）：字幕只显示
+            // 结尾若干字，沿用当前宽度即可（见 UpdateBusyLayout）。
+            _liveAnim.CompleteReveal();
             UpdateBusyLayout();
             ShowLayeredAnimated(140);
         }
@@ -1811,6 +1815,10 @@ namespace VoxLeap
         public void SetBusyCaption(string text)
         {
             if (!_busy) return; // 迟到的字幕封送不得改用已退场的浮层尺寸。
+            // 本次录音已经有实时字幕时，收尾态保留的是**用户刚说的那行字**（见 UpdateBusyLayout），
+            // 不让收尾期的增量文本进来抢这一行：流式分段的收尾请求只回最后 2~3 秒的尾段文本，
+            // 覆盖上去会让整行突然缩短、前半句当场消失。第一行仍显示"识别中（Esc 取消）"。
+            if (_liveCaption.Length > 0) return;
             text = text ?? "";
             if (_busyCaption == text) return;
             _busyCaption = text;
@@ -1820,9 +1828,10 @@ namespace VoxLeap
 
         // 录音期实时字幕：把流式分段吐出来的文字画在浮层上，**只显示、不注入**。
         //
-        // 为什么另开一条路径而不是复用 SetBusyCaption：忙碌态是另一套尺寸——
-        // UpdateBusyLayout 按文本测量宽度（26+31+10+文本宽+26）并把高度改成 68，而录音态是
-        // 钉死的 256×76、声波居中于 56px 内容盒。若在 _busy == false 时调 UpdateBusyLayout，
+        // 为什么另开一条路径而不是复用 SetBusyCaption：两者是两套尺寸、两套文本来源——
+        // 收尾态按状态文字测量宽度、高度 68（本次录音有实时字幕时保住录音胶囊的尺寸与那一行字，
+        // 见 UpdateBusyLayout），而录音态是随说话生长的胶囊（见 AdvanceLiveCaption）、
+        // 声波居中于 56px 内容盒。若在 _busy == false 时调 UpdateBusyLayout，
         // 录音态的浮层尺寸会被字幕文本长度牵着走，声波和红点当场错位。
         public void SetLiveCaption(string text)
         {
@@ -1832,9 +1841,10 @@ namespace VoxLeap
             text = text ?? "";
             if (_liveCaption == text) return;
             _liveCaption = text;
-            _liveAnim.SetTextLength(text.Length);
-            // 这里只登记"全文有多长"，真正的推进交给 30fps 帧循环（UpdateLevel → AdvanceLiveCaption）：
-            // 字幕到达与动画解耦，一次到达一大段也不会让浮层瞬间长到位。
+            // 这里只登记"全文有多长、这一批是什么时候到的"，真正的推进交给 30fps 帧循环
+            //（UpdateLevel → AdvanceLiveCaption）：字幕到达与动画解耦，一次到达一大段也不会让
+            // 浮层瞬间长到位；而**到达时刻**正是"按到达速率铺开"的输入（见 LiveCaptionAnim）。
+            _liveAnim.SetTextLength(text.Length, Environment.TickCount);
         }
 
         // 字幕只显示**结尾**若干字，理由与忙碌态的 GetBusyDisplayText 一致：用户是在看着字往外冒，
@@ -1953,11 +1963,24 @@ namespace VoxLeap
             _visualLevel = 0;
         }
 
+        // 收尾态的尺寸。本次录音有实时字幕时**沿用录音胶囊的宽度与两行高度**：用户要求"松手后
+        // 保留刚才那行字"，若这里换回 68 高的小框，那行字就等于被换掉了，而且整块会硬缩一下
+        //（实机反馈的"松手那一下会缩回去"）。
+        // 宽度取 max(录音胶囊当前宽度, 状态文字所需宽度)：宽度**不**跳到目标值（那一下看得见，
+        // 而字幕只显示结尾若干字，沿用当前宽度即可），但不能小到把"识别中（Esc 取消）"挤成省略号。
         private void UpdateBusyLayout()
         {
-            string text = GetBusyDisplayText();
-            int textWidth = TextRenderer.MeasureText(text, Font).Width;
-            Size = new Size(26 + 31 + 10 + textWidth + 26, 68);
+            string status = GetBusyDisplayText();
+            int statusWidth = 26 + 31 + 10 + TextRenderer.MeasureText(status, Font).Width + 26;
+            if (_liveCaption.Length > 0)
+            {
+                int width = _liveAnim.Width > statusWidth ? _liveAnim.Width : statusWidth;
+                Size = new Size(width, LiveCaptionAnim.BaseHeight + LiveCaptionAnim.RowHeight);
+            }
+            else
+            {
+                Size = new Size(statusWidth, 68);
+            }
             Location = ScreenLayout.BottomCenterOf(_busyTarget, Width, Height, 28);
         }
 
@@ -2083,30 +2106,18 @@ namespace VoxLeap
                         false);
                 }
                 DrawBrandWave(g, surface.Right - 74.5f, cy);
-                // 字幕行长到满高才画：这一行约 160ms 从 0 长到 30px，半高时画字会被玻璃边缘
-                // 切掉上下两头，看上去像文字从缝里挤出来。
-                SyncLiveCaptionDisplay();
-                if (_liveAnim.RowPixels >= RecCaptionRowHeight)
-                {
-                    // 录音期字幕行：静音进行中的实时文字，只画在浮层上（本类不持有任何注入能力）。
-                    DrawLayeredText(
-                        g,
-                        _liveCaptionDisplay,
-                        LiveCaptionFont(),
-                        Color.FromArgb(196, 242, 245, 247),
-                        new RectangleF(
-                            surface.Left + RecCaptionLeftInset,
-                            surface.Top + RecRowHeight,
-                            surface.Width - RecCaptionLeftInset - RecCaptionRightInset,
-                            RecCaptionRowHeight),
-                        false);
-                }
+                DrawLiveCaptionRow(g, surface);
             }
             else
             {
-                // 等待态：声音停了，波形归位成 Logo 的静止形态（休止符）。
+                // 等待/收尾态：声音停了，波形归位成 Logo 的静止形态（休止符）。
+                // 本次录音有实时字幕时，第二行**原地保留**刚才那行字（用户要求：松手后不要把它换成
+                // "识别中"），第一行照旧是状态文字。因此状态文字必须钉在第一行的 56px 内，不能再用
+                // surface.Height 垂直居中 —— 否则它会掉到字幕行上去，而 Logo 还留在第一行。
+                bool keepLine = _liveCaption.Length > 0;
+                float rowH = keepLine ? RecRowHeight : surface.Height;
                 float markH = 20f;
-                DrawLogoMark(g, surface.Left + 26, surface.Top + (surface.Height - markH) / 2f, markH);
+                DrawLogoMark(g, surface.Left + 26, surface.Top + (rowH - markH) / 2f, markH);
                 using (var font = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold))
                 {
                     DrawLayeredText(
@@ -2114,10 +2125,33 @@ namespace VoxLeap
                         GetBusyDisplayText(),
                         font,
                         Color.FromArgb(214, 242, 245, 247),
-                        new RectangleF(surface.Left + 26 + 31 + 10, surface.Top, surface.Width - 26 - 31 - 10 - 20, surface.Height),
+                        new RectangleF(surface.Left + 26 + 31 + 10, surface.Top, surface.Width - 26 - 31 - 10 - 20, rowH),
                         false);
                 }
+                if (keepLine) DrawLiveCaptionRow(g, surface);
             }
+        }
+
+        // 实时字幕行：静音进行中的实时文字，只画在浮层上（本类不持有任何注入能力）。
+        // 字幕行长到满高才画：这一行约 160ms 从 0 长到 30px，半高时画字会被玻璃边缘切掉上下两头，
+        // 看上去像文字从缝里挤出来。
+        // 录音态与收尾态共用它：收尾时录音帧循环已停，这一行必须由收尾这次重绘来同步，
+        // 否则 CompleteReveal 补齐的最后几个字根本不会显示。
+        private void DrawLiveCaptionRow(Graphics g, Rectangle surface)
+        {
+            SyncLiveCaptionDisplay();
+            if (_liveAnim.RowPixels < RecCaptionRowHeight) return;
+            DrawLayeredText(
+                g,
+                _liveCaptionDisplay,
+                LiveCaptionFont(),
+                Color.FromArgb(196, 242, 245, 247),
+                new RectangleF(
+                    surface.Left + RecCaptionLeftInset,
+                    surface.Top + RecRowHeight,
+                    surface.Width - RecCaptionLeftInset - RecCaptionRightInset,
+                    RecCaptionRowHeight),
+                false);
         }
 
         private void DrawBrandWave(Graphics g, float cx, float cy)

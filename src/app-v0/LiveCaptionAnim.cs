@@ -28,12 +28,27 @@ namespace VoxLeap
         // 33ms 一帧时约 10 帧（330ms）收敛到 5% 以内。
         private const double WidthTauMs = 110.0;
         private const double RowTauMs = 80.0;
-        // 逐字展开速度：基础 16 字/秒，并按积压加速（上限 80 字/秒）。
-        // 基础值略低于常人语速（约 4~6 字/秒）就够用；积压加速是为了"永远追得上"——
-        // 一段识别结果一次到达十几个字时，不会出现"字还在慢慢吐、人已经说下一句"的滞后。
-        private const double RevealBasePerSecond = 16.0;
-        private const double RevealBacklogGain = 0.40;
-        private const double RevealMaxPerSecond = 80.0;
+        // 逐字展开的速度不再是一个固定值，而是**跟着文本到达的速率走**。
+        //
+        // 为什么（2026-09-26 实机反馈）：分段识别是"每 2.6 秒到一批、每批约 8 字"（用户实测
+        // 13.4s 录音里 5 批共 41 字）。原来的"基础 16 字/秒 + 按积压加速"会把这 8 个字在
+        // 0.42 秒内吐光（每 62ms 蹦一个字，看着就是"一个一个弹出来"），然后空等 2.2 秒 ——
+        // 占空比只有 16%，所以观感永远是"吐一阵、停一阵"，调快调慢都摆脱不了这个节奏。
+        // 改为按观测到的到达速率匀速吐：一批的字摊到下一批到达之前流出，整段录音里字是连续的。
+        // 代价是字幕稳定滞后约 1 秒（一屏之内），换来的是"跟着我说话的节奏流出来"。
+        private const double DefaultRevealPerSecond = 4.5; // 还没有速率估计时的起步值（接近常人语速）
+        private const double RevealHeadroom = 1.2;         // 比到达速率略快，积压才能慢慢排空
+        private const double RevealMinPerSecond = 2.0;
+        private const double RevealMaxPerSecond = 45.0;
+        // 积压超过它就开始按"1.5 秒排空"加速：一次到达一大段（或落得太远）时保证永远追得上；
+        // 积压不大时**不**加速 —— 否则又回到"一口气吐光"。
+        private const double CatchUpBacklogChars = 10.0;
+        private const double CatchUpSeconds = 1.5;
+        // 到达速率的指数平滑系数，以及参与估计的间隔范围（太小是同一批被拆成两次到达，
+        // 太大是中间没人说话，两者都会把速率估计带偏）。
+        private const double RateSmoothing = 0.45;
+        private const int MinRateGapMs = 300;
+        private const int MaxRateGapMs = 8000;
         // 收敛吸附阈值：差值小于它就贴死目标。浮层每帧都要重绘一张 32 位位图，
         // 不能为了 0.04px 的差值让动画永远不结束。
         private const double SettleEpsilon = 0.05;
@@ -45,6 +60,8 @@ namespace VoxLeap
         private bool _rowStarted;
         private double _revealed;
         private int _textLength;
+        private double _ratePerSecond; // 到达速率估计，字/秒；0 表示还没有估计
+        private int _lastArrivalAt;    // 上一批文本到达的时刻（TickCount 毫秒），0 表示还没到过
 
         public LiveCaptionAnim()
         {
@@ -72,14 +89,31 @@ namespace VoxLeap
             _rowStarted = false;
             _revealed = 0.0;
             _textLength = 0;
+            _ratePerSecond = 0.0;
+            _lastArrivalAt = 0;
         }
 
-        // 分段账本累计出来的**全文**长度。只增不减：字幕是逐段追加的，
-        // 若允许变短，胶囊会在屏幕底部来回缩，比不长大更糟。
-        public void SetTextLength(int textLength)
+        // 分段账本累计出来的**全文**长度，以及这一批到达的时刻（TickCount 毫秒）。
+        // 只增不减：字幕是逐段追加的，若允许变短，胶囊会在屏幕底部来回缩，比不长大更糟。
+        // 顺带用"这一批多少字 / 距上一批多少毫秒"估计到达速率 —— 它正是"按到达速率铺开"的输入。
+        public void SetTextLength(int textLength, int nowMs)
         {
             if (textLength < 0) textLength = 0;
-            if (textLength > _textLength) _textLength = textLength;
+            if (textLength <= _textLength) return;
+            int arrived = textLength - _textLength;
+            if (_lastArrivalAt != 0)
+            {
+                int gap = unchecked(nowMs - _lastArrivalAt);
+                if (gap >= MinRateGapMs && gap <= MaxRateGapMs)
+                {
+                    double instant = arrived * 1000.0 / gap;
+                    _ratePerSecond = _ratePerSecond <= 0.0
+                        ? instant
+                        : _ratePerSecond + RateSmoothing * (instant - _ratePerSecond);
+                }
+            }
+            _lastArrivalAt = nowMs;
+            _textLength = textLength;
         }
 
         // 收尾时立即补齐，避免"字还没吐完录音就结束了"。
@@ -97,7 +131,15 @@ namespace VoxLeap
                 double backlog = _textLength - _revealed;
                 if (backlog > 0)
                 {
-                    double speed = RevealBasePerSecond + backlog * RevealBacklogGain;
+                    double speed = _ratePerSecond > 0.0
+                        ? _ratePerSecond * RevealHeadroom
+                        : DefaultRevealPerSecond;
+                    if (backlog > CatchUpBacklogChars)
+                    {
+                        double catchUp = backlog / CatchUpSeconds;
+                        if (catchUp > speed) speed = catchUp;
+                    }
+                    if (speed < RevealMinPerSecond) speed = RevealMinPerSecond;
                     if (speed > RevealMaxPerSecond) speed = RevealMaxPerSecond;
                     _revealed += speed * (deltaMs / 1000.0);
                     if (_revealed > _textLength) _revealed = _textLength;
@@ -134,6 +176,8 @@ namespace VoxLeap
         public bool RowStarted { get { return _rowStarted; } }
         public int RevealedCount { get { return (int)_revealed; } }
         public int TextLength { get { return _textLength; } }
+        // 当前估计的字/秒（0 = 还没有估计）。给测试与排障用：确认"铺开"确实是按到达速率走的。
+        public double RatePerSecond { get { return _ratePerSecond; } }
 
         private static double Ease(double current, double target, int deltaMs, double tauMs)
         {
