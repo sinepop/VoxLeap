@@ -160,8 +160,20 @@ namespace VoxLeap
                 request.ContentType = "application/json";
                 request.Headers["Authorization"] = "Bearer " + cfg.OrganizerApiKey;
                 string system = "你是语音输入整理器。只整理语序和标点，不添加事实。必须保留原文中的数字、专有名词、代码标识符、URL 和否定关系。只输出整理后的正文，不要解释。";
+                // 整理是零推理任务（改标点、去语气词），但 step-3.7-flash 是思考模型：
+                // 实测 34 字输入消耗 363 输出 token，绝大部分是思考，代价 3.7 秒。
+                // 同时请求两种关闭/削弱思考的方式，因为各家部署支持情况不同：
+                //   - chat_template_kwargs.thinking=false：NVIDIA NIM 对同一份权重的开关
+                //     （模板 prefill 一个空思考块）；StepFun 自家 API 文档未列出，可能被忽略。
+                //   - reasoning_effort=low：StepFun 自家 API 文档明确支持；但第三方实测它对
+                //     思考长度只有约 2 倍的影响力，不是硬开关。
+                // 不猜哪个生效：日志里的"输出token"会直接给出答案——
+                //   降到约 50   → 强开关生效
+                //   降到约 180  → 只有 reasoning_effort 生效
+                //   维持 363    → 两者都被忽略，改走结构性方案（按段并行整理）
                 string body = "{\"model\":\"" + VoxleapCore.EscapeJson(cfg.OrganizerModel) +
-                    "\",\"temperature\":0.1,\"messages\":[{\"role\":\"system\",\"content\":\"" +
+                    "\",\"temperature\":0.1,\"reasoning_effort\":\"low\"," +
+                    "\"chat_template_kwargs\":{\"thinking\":false},\"messages\":[{\"role\":\"system\",\"content\":\"" +
                     VoxleapCore.EscapeJson(system) + "\"},{\"role\":\"user\",\"content\":\"" +
                     VoxleapCore.EscapeJson(original) + "\"}]}";
                 byte[] bytes = Encoding.UTF8.GetBytes(body);
