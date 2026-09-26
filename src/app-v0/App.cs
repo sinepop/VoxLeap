@@ -514,6 +514,17 @@ namespace VoxLeap
             }
         }
 
+        // 当前累计说话时长（毫秒，静音不计）。实时字幕的"按说话速率铺开"拿它当分母：
+        // 用"距上批的间隔"当分母会把用户的停顿算成"说得慢"，速率被估低约四成，滞后一路累积，
+        // 最后被积压加速一次性吐出来（实机反馈的"停顿一下之后出来一堆字"）。
+        public static int CurrentSpeechMs()
+        {
+            lock (_segmenterGate)
+            {
+                return _segmenter == null ? 0 : _segmenter.SpeechMsTotal;
+            }
+        }
+
         [DllImport("winmm.dll", CharSet = CharSet.Auto)]
         private static extern int mciSendString(string command, StringBuilder buffer, int bufferSize, IntPtr callback);
 
@@ -1833,7 +1844,9 @@ namespace VoxLeap
         // 见 UpdateBusyLayout），而录音态是随说话生长的胶囊（见 AdvanceLiveCaption）、
         // 声波居中于 56px 内容盒。若在 _busy == false 时调 UpdateBusyLayout，
         // 录音态的浮层尺寸会被字幕文本长度牵着走，声波和红点当场错位。
-        public void SetLiveCaption(string text)
+        // speechMsTotal = 当时累计的**说话时长**（静音不计）。它是铺开速率的分母：
+        // 用"距上批的间隔"当分母会把停顿的沉默算进去、把速率估低（见 LiveCaptionAnim 的常量注释）。
+        public void SetLiveCaption(string text, int speechMsTotal)
         {
             // 只有"正在录音且还没进收尾"时才画字幕：收尾（_busy）与等待态走原有 SetBusyCaption，
             // 这里的迟到封送不得改尺寸、也不得覆盖收尾字幕。
@@ -1841,11 +1854,14 @@ namespace VoxLeap
             text = text ?? "";
             if (_liveCaption == text) return;
             _liveCaption = text;
-            // 这里只登记"全文有多长、这一批是什么时候到的"，真正的推进交给 30fps 帧循环
-            //（UpdateLevel → AdvanceLiveCaption）：字幕到达与动画解耦，一次到达一大段也不会让
-            // 浮层瞬间长到位；而**到达时刻**正是"按到达速率铺开"的输入（见 LiveCaptionAnim）。
-            _liveAnim.SetTextLength(text.Length, Environment.TickCount);
+            // 这里只登记"全文有多长、这一批是什么时候到的、当时说了多久"，真正的推进交给 30fps
+            // 帧循环（UpdateLevel → AdvanceLiveCaption）：字幕到达与动画解耦，一次到达一大段也不会
+            // 让浮层瞬间长到位。
+            _liveAnim.SetTextLength(text.Length, Environment.TickCount, speechMsTotal);
         }
+
+        // 当前铺开速率（字/秒）。给主流程记一行可核对日志用，不参与绘制。
+        public double LiveCaptionRate { get { return _liveAnim.RatePerSecond; } }
 
         // 字幕只显示**结尾**若干字，理由与忙碌态的 GetBusyDisplayText 一致：用户是在看着字往外冒，
         // 刚说出口的那一截才是新信息，前面说过的是已知内容。
@@ -3092,7 +3108,13 @@ namespace VoxLeap
                         // 会话身份校验：已经收尾（_streamRunner 置 null）或已经开了新录音时，
                         // 上一会话迟到的那串字绝不能画到新会话的浮层上。
                         if (!object.ReferenceEquals(_streamRunner, runner)) return;
-                        _overlay.SetLiveCaption(text);
+                        int speechMs = Recorder.CurrentSpeechMs();
+                        _overlay.SetLiveCaption(text, speechMs);
+                        // 每次字幕到达记一行**只有长度与时间**的账（不记正文，见产品约束 5）。
+                        // 这一行是"铺开"唯一的可核对证据：间隔与说话时长能算出应有的铺开速率，
+                        // 也能看出批次有多密（实机调手感全靠它，不然只能猜）。
+                        Log.Write("实时字幕: 累计=" + (text == null ? 0 : text.Length) + "字 说话="
+                            + speechMs + "ms 铺开速率=" + _overlay.LiveCaptionRate.ToString("0.0") + "字/秒");
                     }
                     catch { }
                 });

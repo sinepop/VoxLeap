@@ -28,24 +28,27 @@ namespace VoxLeap
         // 33ms 一帧时约 10 帧（330ms）收敛到 5% 以内。
         private const double WidthTauMs = 110.0;
         private const double RowTauMs = 80.0;
-        // 逐字展开的速度不再是一个固定值，而是**跟着文本到达的速率走**。
+        // 逐字展开的速度不再是一个固定值，而是**跟着说话的速率走**。
         //
         // 为什么（2026-09-26 实机反馈）：分段识别是"每 2.6 秒到一批、每批约 8 字"（用户实测
         // 13.4s 录音里 5 批共 41 字）。原来的"基础 16 字/秒 + 按积压加速"会把这 8 个字在
         // 0.42 秒内吐光（每 62ms 蹦一个字，看着就是"一个一个弹出来"），然后空等 2.2 秒 ——
         // 占空比只有 16%，所以观感永远是"吐一阵、停一阵"，调快调慢都摆脱不了这个节奏。
-        // 改为按观测到的到达速率匀速吐：一批的字摊到下一批到达之前流出，整段录音里字是连续的。
-        // 代价是字幕稳定滞后约 1 秒（一屏之内），换来的是"跟着我说话的节奏流出来"。
+        //
+        // 速率的分母必须是**说话时长**（静音不计），不能是"距上批的间隔"：后者含着用户停顿的
+        // 沉默，会把速率估低 —— 实测同一段录音，按说话时长是 41 字 / 7.9s = 5.2 字/秒，按到达
+        // 间隔只有 8 字 / 2.6s = 3.1 字/秒。估低会让滞后一路累积，最后被"积压加速"一次性吐出来，
+        // 那正是第二次实机反馈的"停顿一下之后，出来一堆字"。
         private const double DefaultRevealPerSecond = 4.5; // 还没有速率估计时的起步值（接近常人语速）
-        private const double RevealHeadroom = 1.2;         // 比到达速率略快，积压才能慢慢排空
+        private const double RevealHeadroom = 1.2;         // 比说话速率略快，积压才能慢慢排空
         private const double RevealMinPerSecond = 2.0;
         private const double RevealMaxPerSecond = 45.0;
-        // 积压超过它就开始按"1.5 秒排空"加速：一次到达一大段（或落得太远）时保证永远追得上；
-        // 积压不大时**不**加速 —— 否则又回到"一口气吐光"。
-        private const double CatchUpBacklogChars = 10.0;
-        private const double CatchUpSeconds = 1.5;
-        // 到达速率的指数平滑系数，以及参与估计的间隔范围（太小是同一批被拆成两次到达，
-        // 太大是中间没人说话，两者都会把速率估计带偏）。
+        // 滞后按**秒**兜底，而不是按字数：正常一批十几到二十字本来就要好几秒才吐完，
+        // 按字数兜底（上一版是"积压 >10 字就按 1.5 秒排空"）会把正常批次也加速成"一口气吐光"。
+        private const double MaxLagSeconds = 3.0;
+        // 说话时长至少要累计到这里，算出来的速率才可信（太短会被一两个字的抖动放大）。
+        private const int MinRateSpeechMs = 500;
+        // 备用速率估计（说话时长还不够时顶一下）：按"距上批的间隔"做指数平滑。
         private const double RateSmoothing = 0.45;
         private const int MinRateGapMs = 300;
         private const int MaxRateGapMs = 8000;
@@ -60,8 +63,9 @@ namespace VoxLeap
         private bool _rowStarted;
         private double _revealed;
         private int _textLength;
-        private double _ratePerSecond; // 到达速率估计，字/秒；0 表示还没有估计
-        private int _lastArrivalAt;    // 上一批文本到达的时刻（TickCount 毫秒），0 表示还没到过
+        private double _speechRatePerSecond; // 首选估计：累计字数 / 累计说话时长（不受停顿影响）
+        private double _gapRatePerSecond;    // 备用估计：按到达间隔平滑（只在会话开头几秒用）
+        private int _lastArrivalAt;          // 上一批文本到达的时刻（TickCount 毫秒），0 表示还没到过
 
         public LiveCaptionAnim()
         {
@@ -89,31 +93,47 @@ namespace VoxLeap
             _rowStarted = false;
             _revealed = 0.0;
             _textLength = 0;
-            _ratePerSecond = 0.0;
+            _speechRatePerSecond = 0.0;
+            _gapRatePerSecond = 0.0;
             _lastArrivalAt = 0;
         }
 
-        // 分段账本累计出来的**全文**长度，以及这一批到达的时刻（TickCount 毫秒）。
+        // 分段账本累计出来的**全文**长度、这一批到达的时刻（TickCount 毫秒）、以及当时累计的
+        // **说话时长**（毫秒，静音不计，来自 SpeechSegmenter.SpeechMsTotal）。
         // 只增不减：字幕是逐段追加的，若允许变短，胶囊会在屏幕底部来回缩，比不长大更糟。
-        // 顺带用"这一批多少字 / 距上一批多少毫秒"估计到达速率 —— 它正是"按到达速率铺开"的输入。
-        public void SetTextLength(int textLength, int nowMs)
+        public void SetTextLength(int textLength, int nowMs, int speechMsTotal)
         {
             if (textLength < 0) textLength = 0;
             if (textLength <= _textLength) return;
             int arrived = textLength - _textLength;
             if (_lastArrivalAt != 0)
             {
+                // 备用估计：这一批多少字 / 距上批多少毫秒。含停顿的沉默，会估低，所以只当兜底。
                 int gap = unchecked(nowMs - _lastArrivalAt);
                 if (gap >= MinRateGapMs && gap <= MaxRateGapMs)
                 {
                     double instant = arrived * 1000.0 / gap;
-                    _ratePerSecond = _ratePerSecond <= 0.0
+                    _gapRatePerSecond = _gapRatePerSecond <= 0.0
                         ? instant
-                        : _ratePerSecond + RateSmoothing * (instant - _ratePerSecond);
+                        : _gapRatePerSecond + RateSmoothing * (instant - _gapRatePerSecond);
                 }
             }
             _lastArrivalAt = nowMs;
             _textLength = textLength;
+            // 首选估计：累计字数 / 累计说话时长。用户停顿不会把它估低。
+            if (speechMsTotal >= MinRateSpeechMs && textLength > 0)
+            {
+                double bySpeech = textLength * 1000.0 / speechMsTotal;
+                if (bySpeech > 0.0) _speechRatePerSecond = bySpeech;
+            }
+        }
+
+        // 当前用于铺开的速率（字/秒）：优先说话速率，其次到达间隔，最后是起步值。
+        private double EffectiveRatePerSecond()
+        {
+            if (_speechRatePerSecond > 0.0) return _speechRatePerSecond;
+            if (_gapRatePerSecond > 0.0) return _gapRatePerSecond;
+            return DefaultRevealPerSecond;
         }
 
         // 收尾时立即补齐，避免"字还没吐完录音就结束了"。
@@ -131,13 +151,12 @@ namespace VoxLeap
                 double backlog = _textLength - _revealed;
                 if (backlog > 0)
                 {
-                    double speed = _ratePerSecond > 0.0
-                        ? _ratePerSecond * RevealHeadroom
-                        : DefaultRevealPerSecond;
-                    if (backlog > CatchUpBacklogChars)
+                    double speed = EffectiveRatePerSecond() * RevealHeadroom;
+                    // 只有真的落下超过 MaxLagSeconds 才加速排空；正常一批（十到二十字）不加速，
+                    // 否则又会回到"一口气吐光"。
+                    if (speed > 0.0 && backlog / speed > MaxLagSeconds)
                     {
-                        double catchUp = backlog / CatchUpSeconds;
-                        if (catchUp > speed) speed = catchUp;
+                        speed = backlog / MaxLagSeconds;
                     }
                     if (speed < RevealMinPerSecond) speed = RevealMinPerSecond;
                     if (speed > RevealMaxPerSecond) speed = RevealMaxPerSecond;
@@ -176,8 +195,10 @@ namespace VoxLeap
         public bool RowStarted { get { return _rowStarted; } }
         public int RevealedCount { get { return (int)_revealed; } }
         public int TextLength { get { return _textLength; } }
-        // 当前估计的字/秒（0 = 还没有估计）。给测试与排障用：确认"铺开"确实是按到达速率走的。
-        public double RatePerSecond { get { return _ratePerSecond; } }
+        // 当前用于铺开的速率（字/秒）。给测试与排障用：确认"铺开"确实跟着说话速率走。
+        public double RatePerSecond { get { return EffectiveRatePerSecond(); } }
+        // 首选估计本身（0 = 说话时长还不够，正在用备用估计或起步值）。
+        public double SpeechRatePerSecond { get { return _speechRatePerSecond; } }
 
         private static double Ease(double current, double target, int deltaMs, double tauMs)
         {

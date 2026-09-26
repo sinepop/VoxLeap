@@ -36,7 +36,8 @@ internal static class LiveCaptionAnimTest
         TestWidthEasesWithoutOvershoot();
         TestWidthIndependentOfFrameRate();
         TestRevealMonotonicAndNoOvershoot();
-        TestRevealPacedByArrivalRate();
+        TestRevealPacedBySpeechDuration();
+        TestSpeechDurationBeatsArrivalGap();
         TestArrivalRateGuards();
         TestPacingLagStaysBounded();
         TestRevealCatchesUpWithBacklog();
@@ -102,7 +103,7 @@ internal static class LiveCaptionAnimTest
         var a = new LiveCaptionAnim();
         a.Reset(1920);
         CheckEq("1920 工作区的宽度上限", 480, a.MaxWidth);
-        a.SetTextLength(400, 1000); // 400 字，远超一行
+        a.SetTextLength(400, 1000, 0); // 400 字，远超一行
         for (int f = 0; f < 120; f++)
         {
             a.AdvanceReveal(33);
@@ -158,7 +159,7 @@ internal static class LiveCaptionAnimTest
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(10, 1000);
+        a.SetTextLength(10, 1000, 0);
         int last = 0;
         bool monotonic = true;
         bool overshoot = false;
@@ -176,96 +177,116 @@ internal static class LiveCaptionAnimTest
         CheckEq("最终一定吐完", 10, a.RevealedCount);
     }
 
-    // 按到达速率铺开（2026-09-26 实机反馈："一个一个弹出来"+"过一段时间跳一段"）。
-    // 用实测节拍构造两批：每 2.6 秒到 8 字。要点是字被**摊开**吐，且速率估计确实建起来了。
-    private static void TestRevealPacedByArrivalRate()
+    // 铺开速率的分母是**说话时长**（静音不计），不是到达间隔。实测同一段录音：
+    // 41 字 / 说话 7.9s = 5.2 字/秒，而按"8 字 / 2.6s 到达间隔"只有 3.1 字/秒 —— 估低四成，
+    // 滞后就会一路累积，最后被积压加速一次性吐出来（"停顿一下之后出来一堆字"）。
+    private static void TestRevealPacedBySpeechDuration()
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        int t = 1000;
-        a.SetTextLength(8, t); // 第一批 8 字
-        for (int f = 0; f < 18; f++) { a.AdvanceReveal(33); t += 33; } // 约 600ms
-        Check("第一段 600ms 内吐不出 4 个字以上（不再是 0.42 秒吐光）", a.RevealedCount <= 4);
+        a.SetTextLength(12, 2000, 2300); // 12 字，其中说话 2.3 秒 ⇒ 5.2 字/秒
+        Check("速率按说话时长算", Math.Abs(a.RatePerSecond - 12.0 * 1000.0 / 2300.0) < 0.01);
+        Check("速率落在常人语速量级（2~6 字/秒）", a.RatePerSecond >= 2.0 && a.RatePerSecond <= 6.0);
 
-        while (t < 3600) { a.AdvanceReveal(33); t += 33; } // 推进到第二批该到的时刻
-        CheckEq("两批之间把第一批吐完", 8, a.RevealedCount);
+        // 12 字按 5.2×1.2 = 6.26 字/秒铺开 ⇒ 约 1.9 秒吐完（滞后 1.9s < 3s，不该被额外加速）。
+        for (int f = 0; f < 30; f++) a.AdvanceReveal(33); // 990ms
+        Check("1 秒后仍在按速率铺开（没有一口气吐光）", a.RevealedCount >= 3 && a.RevealedCount <= 9);
+        for (int f = 0; f < 28; f++) a.AdvanceReveal(33); // 累计 1914ms
+        Check("约 1.9 秒吐完 12 字（≈ 12 / 5.2 秒）", a.RevealedCount >= 11);
+    }
 
-        a.SetTextLength(16, t); // 第二批又 8 字（累计 16）⇒ 间隔约 2.6 秒，据此估计速率
-        Check("按到达间隔建立起速率估计", Math.Abs(a.RatePerSecond - 8.0 * 1000.0 / (t - 1000)) < 0.01);
-        Check("速率估计落在常人语速量级（2~6 字/秒）", a.RatePerSecond >= 2.0 && a.RatePerSecond <= 6.0);
-
-        for (int f = 0; f < 30; f++) a.AdvanceReveal(33); // 约 1 秒
-        Check("第二批 1 秒内仍在慢慢吐（不是又一次吐光）", a.RevealedCount < 16);
+    // 关键回归：到达间隔里含着长停顿，速率也不得被估低（分母必须是说话时长）。
+    private static void TestSpeechDurationBeatsArrivalGap()
+    {
+        var a = new LiveCaptionAnim();
+        a.Reset(1920);
+        a.SetTextLength(10, 1000, 2000); // 10 字 / 说话 2.0s ⇒ 5.0 字/秒
+        a.SetTextLength(20, 5000, 4000); // 又 10 字；到达间隔 4 秒（中间停了 2 秒），说话合计 4.0s
+        Check("速率取说话时长而不是 4 秒的到达间隔", Math.Abs(a.RatePerSecond - 5.0) < 0.01);
+        Check("说话速率本身被记下来", Math.Abs(a.SpeechRatePerSecond - 5.0) < 0.01);
     }
 
     // 速率估计的护栏：同一批被拆成两次到达（间隔过小）、或中间长时间没人说话（间隔过大），
-    // 都不许污染估计 —— 否则"铺开"会被一次抖动带偏，字要么卡住、要么又变成一口气吐光。
+    // 都不许污染备用估计；说话时长太短时也不算速率，一律退回起步值。
     private static void TestArrivalRateGuards()
     {
         var small = new LiveCaptionAnim();
         small.Reset(1920);
-        small.SetTextLength(5, 1000);
-        small.SetTextLength(6, 1100); // 间隔 100ms < 300ms：不参与估计
-        CheckEq("过小间隔不参与速率估计", 0.0, small.RatePerSecond);
+        small.SetTextLength(5, 1000, 0);
+        small.SetTextLength(6, 1100, 0); // 间隔 100ms < 300ms：不参与估计
+        Check("过小间隔不参与速率估计（仍在起步值）", small.RatePerSecond == 4.5);
 
         var big = new LiveCaptionAnim();
         big.Reset(1920);
-        big.SetTextLength(5, 1000);
-        big.SetTextLength(6, 21000); // 间隔 20s > 8s：不参与估计
-        CheckEq("过大间隔不参与速率估计", 0.0, big.RatePerSecond);
+        big.SetTextLength(5, 1000, 0);
+        big.SetTextLength(6, 21000, 0); // 间隔 20s > 8s：不参与估计
+        Check("过大间隔不参与速率估计（仍在起步值）", big.RatePerSecond == 4.5);
 
         var grow = new LiveCaptionAnim();
         grow.Reset(1920);
-        grow.SetTextLength(3, 1000);
-        grow.SetTextLength(8, 2000); // 间隔 1s、到 5 字 ⇒ 5 字/秒
-        Check("正常间隔建立估计", grow.RatePerSecond > 0.0);
+        grow.SetTextLength(3, 1000, 0);
+        grow.SetTextLength(8, 2000, 0); // 间隔 1s、到 5 字 ⇒ 5 字/秒
+        Check("正常间隔建立备用估计", grow.RatePerSecond > 4.5);
+
+        var tiny = new LiveCaptionAnim();
+        tiny.Reset(1920);
+        tiny.SetTextLength(3, 1000, 200); // 说话仅 200ms < 500ms：不算速率
+        Check("说话时长太短不算速率（仍在起步值）", tiny.RatePerSecond == 4.5);
     }
 
-    // "铺开"不等于"永远落后"：真实节拍下连续 10 批，滞后必须有界。
-    // 松手时只会 CompleteReveal 补最后那几个字，滞后若是无界的，用户就会看到字幕越落越远。
+    // "铺开"不等于"永远落后"：真实节拍（每 2.6 秒一批、每批 8 字、说话 5.2 字/秒）连续 10 批，
+    // 滞后必须有界。松手时只会 CompleteReveal 补最后那几个字。
     private static void TestPacingLagStaysBounded()
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
         int t = 1000;
+        int speech = 0;
         int total = 0;
         int maxBacklog = 0;
         for (int batch = 0; batch < 10; batch++)
         {
             total += 8;
-            a.SetTextLength(total, t);
+            speech += 1540; // 每批 8 字按 5.2 字/秒 ⇒ 说话约 1.54 秒
+            a.SetTextLength(total, t, speech);
+            int peak = total - a.RevealedCount; // 刚到达那一刻的滞后（本批的峰值）
+            if (peak > maxBacklog) maxBacklog = peak;
             for (int f = 0; f < 79; f++) { a.AdvanceReveal(33); t += 33; } // 约 2.6 秒
-            int backlog = total - a.RevealedCount;
-            if (backlog > maxBacklog) maxBacklog = backlog;
         }
-        Check("10 批之间最大滞后不超过一批", maxBacklog <= 8);
-        Check("没有越落越远", total - a.RevealedCount <= 8);
+        Check("每批到达时的滞后不超过一批", maxBacklog <= 8);
+        Check("每批都能在这批到下一批之前吐完（没有越落越远）", total - a.RevealedCount <= 2);
     }
 
-    // 一次到达一大段时必须靠积压加速追得上，否则字永远落在人说话后面。
-    // 注意时限：积压越大越快（上限 45 字/秒），但积压回落到阈值以内后**故意**回到铺开速率，
-    // 所以 50 字不是 1 秒吐完，而是约 4.6 秒吐完（5 秒是留了余量的上界）。
+    // 一次到达一大段时必须追得上，但**不按字数加速**：只有滞后超过 3 秒才加速排空。
+    // 上一版按"积压 >10 字就按 1.5 秒排空"加速，把正常的十几字批次也变成"一口气吐光"。
     private static void TestRevealCatchesUpWithBacklog()
     {
-        var small = new LiveCaptionAnim();
-        small.Reset(1920);
-        small.SetTextLength(5, 1000);
-        var big = new LiveCaptionAnim();
-        big.Reset(1920);
-        big.SetTextLength(50, 1000);
+        var normal = new LiveCaptionAnim();
+        normal.Reset(1920);
+        normal.SetTextLength(5, 1000, 0); // 5 字：滞后 5/5.4 < 3s ⇒ 不加速
+        var huge = new LiveCaptionAnim();
+        huge.Reset(1920);
+        huge.SetTextLength(30, 1000, 0); // 30 字：滞后 5.6s > 3s ⇒ 加速到 10 字/秒
         for (int f = 0; f < 10; f++)
         {
-            small.AdvanceReveal(33);
-            big.AdvanceReveal(33);
+            normal.AdvanceReveal(33);
+            huge.AdvanceReveal(33);
         }
-        Check("积压越大吐得越快", big.RevealedCount > small.RevealedCount);
+        Check("滞后超过 3 秒才加速", huge.RevealedCount > normal.RevealedCount);
+
+        // 回归：正常的二十字批次不得被加速（上一版会以 13 字/秒吐出来）。
+        var twenty = new LiveCaptionAnim();
+        twenty.Reset(1920);
+        twenty.SetTextLength(20, 1000, 0);
+        for (int f = 0; f < 30; f++) twenty.AdvanceReveal(33); // 990ms
+        Check("二十字批次按铺开速率走（990ms 不超过 8 字）", twenty.RevealedCount <= 8);
 
         bool caughtUp = false;
         for (int f = 0; f < 160 && !caughtUp; f++)
         {
-            caughtUp = big.AdvanceReveal(33) >= 50;
+            caughtUp = huge.AdvanceReveal(33) >= 30;
         }
-        Check("50 字积压能在 5 秒内追平", caughtUp);
+        Check("30 字积压能在 5 秒内追平", caughtUp);
     }
 
     // 字幕行只在有字要吐之后才开始长，且本次录音内只增不减。
@@ -273,7 +294,7 @@ internal static class LiveCaptionAnimTest
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(20, 1000);
+        a.SetTextLength(20, 1000, 0);
         CheckEq("未开始时长 0 像素", 0, a.RowPixels);
         int last = 0;
         bool monotonic = true;
@@ -294,7 +315,7 @@ internal static class LiveCaptionAnimTest
     {
         var a = new LiveCaptionAnim();
         a.Reset(1920);
-        a.SetTextLength(30, 1000);
+        a.SetTextLength(30, 1000, 0);
         a.AdvanceReveal(33); // 让字幕行开始
         a.AdvanceLayout(33, 300);
         a.CompleteReveal();
