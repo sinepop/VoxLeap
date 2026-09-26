@@ -123,6 +123,9 @@ namespace VoxLeap
         // 开启后不必一直按住热键，连续静音超过 AutoStopSilenceMs 即自动结束并开始识别。
         public bool AutoStopOnSilence = false;
         public int AutoStopSilenceMs = 1200;
+        // 边说边送：说话期间就把已完成的分段送出去识别，松手时只剩尾段要传。
+        // 默认关闭（默认收紧）；任一段失败即回退整段上传，因此正确性不依赖它。
+        public bool StreamingSegments = false;
         public bool AiOrganize = false;
         public string OrganizerBaseUrl = "";
         public string OrganizerEndpoint = "/chat/completions";
@@ -168,6 +171,7 @@ namespace VoxLeap
             VadThreshold = other.VadThreshold;
             VadPaddingMs = other.VadPaddingMs;
             AutoStopOnSilence = other.AutoStopOnSilence;
+            StreamingSegments = other.StreamingSegments;
             AutoStopSilenceMs = other.AutoStopSilenceMs;
             AiOrganize = other.AiOrganize;
             OrganizerBaseUrl = other.OrganizerBaseUrl;
@@ -432,17 +436,67 @@ namespace VoxLeap
         private static SpeechSegmenter _segmenter;
         private static readonly object _segmenterGate = new object();
 
+        // ---- 边说边送：分段 PCM 累积 ------------------------------------------
+        // 单段软上限 5 秒。连续说话没有停顿时分段边界不会触发，靠它保证"字一直在出"；
+        // 到达软上限后再等第一个静音帧才切，避免切在词中间。12 秒硬上限兜底。
+        private const int SegSoftCloseBytes = 16000 * 2 * 5;
+        private const int SegHardCloseBytes = 16000 * 2 * 12;
+        private static byte[] _segBuf;
+        private static int _segLen;
+        private static double _speechRms;
+        // 由宿主设置，在 waveIn 回调线程上触发。回调内不得做 I/O——它只负责派发。
+        public static Action<byte[]> SegmentReady;
+
         // 由 waveIn 回调线程逐帧调用（每 100ms 一次）。只做纯内存计算，不做磁盘或网络 I/O，
         // 避免在音频回调里引入阻塞。
         // live=false 表示这是停机回收的半满缓冲：字节要记账，但不能当成一个完整帧。
-        private static void OnAudioFrame(double rmsRaw, int bytesRecorded, bool live)
+        private static void OnAudioFrame(double rmsRaw, byte[] frame, int bytesRecorded, bool live)
         {
+            byte[] ready = null;
             lock (_segmenterGate)
             {
                 if (_segmenter == null) return;
                 _segmenter.NoteAudioBytes(bytesRecorded, live);
-                if (live) _segmenter.Feed(rmsRaw);
+                // 停机回收的半满缓冲携带的是真实音频（正好是最后一小段），必须补进分段缓冲，
+                // 否则尾段会丢掉最后约 100ms；但它不是完整帧，所以不喂 Feed。
+                AppendSegmentBytes(frame, bytesRecorded);
+                if (live)
+                {
+                    SpeechSegmenter.Signal signal = _segmenter.Feed(rmsRaw);
+                    // 软上限到了之后要等到第一个静音帧才切——不要在词中间切。
+                    bool forceClose = _segLen >= SegHardCloseBytes
+                        || (_segLen >= SegSoftCloseBytes && rmsRaw < _speechRms);
+                    if (signal == SpeechSegmenter.Signal.SegmentBoundary || forceClose) ready = TakeSegment();
+                }
             }
+            // 锁外触发：宿主在这里派发上传，绝不阻塞音频回调。
+            if (ready != null && SegmentReady != null) SegmentReady(ready);
+        }
+
+        private static void AppendSegmentBytes(byte[] frame, int count)
+        {
+            if (frame == null || count <= 0) return;
+            if (_segBuf == null) _segBuf = new byte[SegSoftCloseBytes * 2];
+            if (_segLen + count > _segBuf.Length)
+            {
+                int size = _segBuf.Length;
+                while (size < _segLen + count) size *= 2;
+                byte[] bigger = new byte[size];
+                Array.Copy(_segBuf, bigger, _segLen);
+                _segBuf = bigger;
+            }
+            Array.Copy(frame, 0, _segBuf, _segLen, count);
+            _segLen += count;
+        }
+
+        // 取走当前段。调用方必须已持有 _segmenterGate。
+        private static byte[] TakeSegment()
+        {
+            if (_segLen == 0) return null;
+            byte[] pcm = new byte[_segLen];
+            Array.Copy(_segBuf, pcm, _segLen);
+            _segLen = 0;
+            return pcm;
         }
 
         // 供录音计时器轮询：静音是否已持续到该收尾。只读查询，不改动影子记录状态。
@@ -481,9 +535,11 @@ namespace VoxLeap
             // 与批处理 VAD 同口径：把 vadThreshold 的 16bit RMS 换算成归一化 RMS，
             // 避免实时分段与事后 VAD 出现两套互相矛盾的阈值。
             double speechRms = Math.Max(1, vadThreshold) / 32768.0;
+            _speechRms = speechRms;
             lock (_segmenterGate)
             {
                 _segmenter = new SpeechSegmenter(100, speechRms, ShadowMinSpeechMs, ShadowSplitSilenceMs, ShadowEndSilenceMs);
+                _segLen = 0; // 新会话：丢弃上一段遗留
             }
             try
             {
@@ -506,6 +562,11 @@ namespace VoxLeap
         {
             if (!_open) return false;
             StopLevelMonitor();
+            // 尾段：StopLevelMonitor 已等待全部回调回收，因此缓冲里就是完整的最后一段。
+            // 这一段是"松手后还需要等"的唯一来源——前面的段在说话期间就送出去了。
+            byte[] tail;
+            lock (_segmenterGate) { tail = TakeSegment(); }
+            if (tail != null && SegmentReady != null) SegmentReady(tail);
             Send("stop " + Alias);
             int err = Send("save " + Alias + " \"" + wavPath + "\"");
             Send("close " + Alias);
@@ -518,6 +579,8 @@ namespace VoxLeap
         {
             if (!_open) return;
             StopLevelMonitor();
+            // 取消路径：丢掉未送出的音频，不派发（已经送出去的段由宿主整体丢弃）。
+            lock (_segmenterGate) { _segLen = 0; }
             Send("stop " + Alias);
             Send("close " + Alias);
             _open = false;
@@ -760,7 +823,7 @@ namespace VoxLeap
                     //  - 残缺且正在停机：waveInReset 回收的在途半满缓冲，不是完整帧；
                     //  - 残缺但仍在运行：异常情况，按整帧记账，让"差"变负把丢帧暴露出来。
                     bool live = bytes >= BufferBytes || Thread.VolatileRead(ref _stopping) == 0;
-                    Recorder.OnAudioFrame(rms, bytes, live); // 分段用：原始归一化 RMS，不做显示放大
+                    Recorder.OnAudioFrame(rms, _frame, bytes, live); // 分段用：原始 RMS + 本帧 PCM
 
                     // Reset 会把剩余缓冲区回调回来；停止标记避免在释放前重新入队。
                     // 计数：回调让“一个在途缓冲结束”；若成功重新入队则保持计数，
@@ -835,6 +898,35 @@ namespace VoxLeap
             catch (WebException wex)
             {
                 HandleWebException(result, wex, session, sw);
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.Message;
+            }
+            finally
+            {
+                result.LatencySeconds = sw.Elapsed.TotalSeconds;
+            }
+            return result;
+        }
+
+        // 边说边送：分段音频已经在内存里，不必再落盘读回。
+        // 与整段上传共用同一条链路（PrepareAudio → provider），所以行为一致，没有第二套实现。
+        public static AsrResult TranscribePcm(Config cfg, byte[] pcm, AsrSession session)
+        {
+            var result = new AsrResult();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                byte[] wav = VoxleapCore.CreatePcmWav(pcm, 16000);
+                IStreamingAsrProvider provider = CreateProvider(cfg);
+                // 分段不进会话延迟分解：那段账是给整段路径算的，
+                // 让分段覆盖它会把整段的 VAD 字节数污染成最后一段的。
+                return provider.Transcribe(cfg, PrepareAudio(cfg, wav, null), session);
+            }
+            catch (WebException wex)
+            {
+                result.Error = wex.Message;
             }
             catch (Exception ex)
             {
@@ -2353,6 +2445,8 @@ namespace VoxLeap
         private uint _targetPid; // 录音开始时的目标进程 ID，注入前复核句柄是否被复用（P1：窗口身份校验）
         private bool _hotkeyWasDown;
         private AsrSession _asrSession;
+        // 边说边送会话：仅在开启 streamingSegments 时非空。waveIn 线程会读它，故 volatile。
+        private volatile StreamingSegmentRunner _streamRunner;
         // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
         private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
@@ -2385,6 +2479,13 @@ namespace VoxLeap
             {
                 if (!_cfg.AutoStopOnSilence) return false;
                 return Recorder.ShouldAutoStopOnSilence(_cfg.AutoStopSilenceMs);
+            };
+            // 边说边送：分段就绪回调由 waveIn 线程触发，这里只派发、不做 I/O。
+            // 没有流式会话时直接丢弃——默认关闭时这条链路完全不存在。
+            Recorder.SegmentReady = delegate(byte[] pcm)
+            {
+                StreamingSegmentRunner r = _streamRunner;
+                if (r != null) r.Dispatch(pcm);
             };
             _toast = new ToastForm();
 
@@ -2698,6 +2799,8 @@ namespace VoxLeap
                 _recordStart = DateTime.Now;
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
+                // 边说边送会话：默认关闭时为 null，整条流式链路完全不存在。
+                _streamRunner = _cfg.StreamingSegments ? new StreamingSegmentRunner(_cfg) : null;
                 Log.Write("开始录音");
             }
             catch (Exception ex)
@@ -2714,6 +2817,9 @@ namespace VoxLeap
         private void OnHoldRelease()
         {
             LatencyTrace trace = _trace;
+            // 摘掉流式会话：之后的分段派发一律不再受理（本会话已有结果仍由 stream 持有，
+            // 尾段在 StopAndSave 里派发，所以摘除必须晚于它——见下方 StopAndSave 之后再取）。
+            StreamingSegmentRunner stream = _streamRunner;
             // 松手 = 用户开始等待的起点。
             if (trace != null) trace.Mark(LatencyTrace.Release);
             _overlay.HideOverlay();
@@ -2742,6 +2848,8 @@ namespace VoxLeap
                 return;
             }
             if (trace != null) trace.Mark(LatencyTrace.Saved);
+            // 尾段已在 StopAndSave 内派发完毕，现在才摘除流式会话。
+            _streamRunner = null;
             var session = new AsrSession();
             session.Trace = trace;
             session.OnPartial = delegate(string text)
@@ -2763,7 +2871,7 @@ namespace VoxLeap
             _asrSession = session;
             _state = State.Transcribing;
             _overlay.ShowBusy("识别中（Esc 取消）", _target);
-            Thread t = new Thread(delegate() { TranscribeWorker(wav, session); });
+            Thread t = new Thread(delegate() { TranscribeWorker(wav, session, stream); });
             t.IsBackground = true;
             t.Start();
         }
@@ -2775,12 +2883,35 @@ namespace VoxLeap
             _state = State.Idle;
         }
 
-        private void TranscribeWorker(string wav, AsrSession session)
+        // 等所有分段结算并按序拼接。任一段失败或超时即返回 null，调用方回退整段上传——
+        // 这是流式的正确性底线：宁可慢，也绝不把残缺文本交给用户。
+        private AsrResult CollectStreamedTranscript(StreamingSegmentRunner stream)
+        {
+            bool settled = stream.WaitAll(_cfg.RequestTimeoutMs);
+            string text = settled ? stream.Ledger.Stitch() : null;
+            Log.Write(stream.Ledger.ToLogLine()
+                + " 分段音频=" + stream.SegmentBytes + "字节 已请求=" + stream.Requests
+                + " 等待=" + (settled ? "已全部结算" : "超时"));
+            if (string.IsNullOrEmpty(text))
+            {
+                Log.Write("流式分段不可信，回退整段上传");
+                return null;
+            }
+            Log.Write("流式分段命中：跳过整段上传");
+            var r = new AsrResult();
+            r.Ok = true;
+            r.HttpStatus = 200;
+            r.Text = text;
+            return r;
+        }
+
+        private void TranscribeWorker(string wav, AsrSession session, StreamingSegmentRunner stream)
         {
             AsrResult res;
             try
             {
-                res = AsrClient.Transcribe(_cfg, wav, session);
+                res = stream == null ? null : CollectStreamedTranscript(stream);
+                if (res == null) res = AsrClient.Transcribe(_cfg, wav, session);
                 if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
                 {
                     ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();

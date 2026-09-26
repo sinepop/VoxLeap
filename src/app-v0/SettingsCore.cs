@@ -288,6 +288,7 @@ namespace VoxLeap
                 if (TryReadInt(json, "vadThreshold", out intValue)) cfg.VadThreshold = intValue;
                 if (TryReadInt(json, "vadPaddingMs", out intValue)) cfg.VadPaddingMs = intValue;
                 if (TryReadBool(json, "autoStopOnSilence", out boolValue)) cfg.AutoStopOnSilence = boolValue;
+                if (TryReadBool(json, "streamingSegments", out boolValue)) cfg.StreamingSegments = boolValue;
                 if (TryReadInt(json, "autoStopSilenceMs", out intValue)) cfg.AutoStopSilenceMs = intValue;
                 if (TryReadBool(json, "aiOrganize", out boolValue)) cfg.AiOrganize = boolValue;
                 if (TryReadString(json, "organizerBaseUrl", out value)) cfg.OrganizerBaseUrl = value;
@@ -357,6 +358,7 @@ namespace VoxLeap
             AppendInt(sb, "vadThreshold", normalized.VadThreshold, true);
             AppendInt(sb, "vadPaddingMs", normalized.VadPaddingMs, true);
             AppendBool(sb, "autoStopOnSilence", normalized.AutoStopOnSilence, true);
+            AppendBool(sb, "streamingSegments", normalized.StreamingSegments, true);
             AppendInt(sb, "autoStopSilenceMs", normalized.AutoStopSilenceMs, true);
             AppendBool(sb, "aiOrganize", normalized.AiOrganize, true);
             AppendString(sb, "organizerBaseUrl", normalized.OrganizerBaseUrl, true);

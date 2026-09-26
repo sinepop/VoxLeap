@@ -317,6 +317,7 @@ namespace VoxLeap
         private NumericUpDown _vadPaddingMs;
         private CheckBox _autoStopBox;
         private NumericUpDown _autoStopSilenceMs;
+        private CheckBox _streamingBox;
         private TextBox _organizerBaseUrlBox;
         private TextBox _organizerEndpointBox;
         private TextBox _organizerModelBox;
@@ -681,6 +682,14 @@ namespace VoxLeap
             _autoStopBox.CheckedChanged += delegate { _autoStopSilenceMs.Enabled = _autoStopBox.Checked; };
             AddField(advanced, "静音时长", WrapWithSuffix(_autoStopSilenceMs, "毫秒"), null, false);
 
+            _streamingBox = new CheckBox();
+            _streamingBox.AutoSize = true;
+            _streamingBox.Font = SettingsTheme.Body;
+            _streamingBox.Text = "边说边送（说话期间就分段上传）";
+            AddField(advanced, "边说边送", _streamingBox,
+                "默认关闭。开启后说话期间就把已完成的分段送去识别，松手时只剩最后一段要传，"
+                + "因此松手后的等待大幅缩短。任一段失败会自动回退到整段上传，不会产生残缺文本。", false);
+
             _aiOrganizeBox = new CheckBox();
             _aiOrganizeBox.AutoSize = true;
             _aiOrganizeBox.Font = SettingsTheme.Body;
@@ -948,6 +957,7 @@ namespace VoxLeap
             _vadPaddingMs.Value = Clamp(_vadPaddingMs, cfg.VadPaddingMs);
             _autoStopSilenceMs.Value = Clamp(_autoStopSilenceMs, cfg.AutoStopSilenceMs);
             _autoStopBox.Checked = cfg.AutoStopOnSilence;
+            _streamingBox.Checked = cfg.StreamingSegments;
             _aiOrganizeBox.Checked = cfg.AiOrganize;
             _organizerBaseUrlBox.Text = cfg.OrganizerBaseUrl;
             _organizerEndpointBox.Text = cfg.OrganizerEndpoint;
@@ -1149,6 +1159,7 @@ namespace VoxLeap
             updated.VadPaddingMs = (int)_vadPaddingMs.Value;
             updated.AutoStopOnSilence = _autoStopBox.Checked;
             updated.AutoStopSilenceMs = (int)_autoStopSilenceMs.Value;
+            updated.StreamingSegments = _streamingBox.Checked;
             updated.AiOrganize = _aiOrganizeBox.Checked;
             updated.OrganizerBaseUrl = _organizerBaseUrlBox.Text;
             updated.OrganizerEndpoint = _organizerEndpointBox.Text;

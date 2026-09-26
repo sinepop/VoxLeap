@@ -17,6 +17,7 @@
   "vadPaddingMs": 180,
   "autoStopOnSilence": false,
   "autoStopSilenceMs": 1200,
+  "streamingSegments": false,
   "aiOrganize": false,
   "organizerBaseUrl": "",
   "organizerEndpoint": "/chat/completions",
