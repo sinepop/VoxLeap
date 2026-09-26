@@ -1667,6 +1667,83 @@ namespace VoxLeap
                 g.DrawString(text, font, brush, bounds, format);
             }
         }
+
+        // 画一行文本，并把**最后一个字**按 lastAlpha 淡入、同时从下方 rise 像素浮上来。
+        // 目的：铺开速率下每个字本来是"啪"一下整字全亮蹦出来的，观感偏硬（用户 2026-09-26 实机
+        // 反馈"还是有点硬"）；让最新那个字 140ms 内升到全亮，就有输入法那种"一直往外冒"的手感。
+        //
+        // 为什么只单独画最后一个字：按说话速率铺开时约每 180ms 才出一个字，140ms 的淡入窗口里
+        // 同一时刻最多一两个字；一次到达一大段（追赶）时多出来的字直接全亮，看不出来。
+        //
+        // 为什么定位要这么绕：分开画就必须知道"前缀画完的 x"，而 GDI+ 的 MeasureString 量前缀宽度
+        // **会多算尾部空白** —— 10pt 雅黑实测：普通 StringFormat 多算约 13px、GenericTypographic
+        // 也多算约 3px，直接用会让最后一个字往右飘出一段可见缝隙。可用的只有
+        // MeasureCharacterRanges：它给的是"该字在本次布局里的位置"，但它给的是**墨迹**左边
+        //（不含字的左侧旁白），直接当绘制起点仍偏 2px。所以再量一次"这个字单独画在 x=0 时墨迹
+        // 离盒子左边多远"作为旁白，回退掉它。
+        // 逐像素验证脚本：`_voxleap-perf/GlyphOffsetCheck.cs`（四种量法对比，只有这一种通过 ±1px，
+        // 尾字墨迹落点与整行一次绘制完全一致：204 = 204）。
+        protected void DrawLayeredTextFadingTail(Graphics g, string text, Font font, Color color,
+            RectangleF bounds, double lastAlpha, float rise)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+            if (lastAlpha >= 1.0)
+            {
+                DrawLayeredText(g, text, font, color, bounds, false);
+                return;
+            }
+            int head = text.Length - 1;
+            string prefix = text.Substring(0, head);
+            string tail = text.Substring(head);
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            g.TextContrast = 0;
+            float tailX;
+            using (var probe = new StringFormat())
+            {
+                probe.Alignment = StringAlignment.Near;
+                probe.LineAlignment = StringAlignment.Center;
+                probe.Trimming = StringTrimming.EllipsisCharacter;
+                probe.FormatFlags = StringFormatFlags.NoWrap;
+                probe.SetMeasurableCharacterRanges(new[] { new CharacterRange(head, 1) });
+                tailX = InkLeftOf(g, probe, text, font, bounds);
+                probe.SetMeasurableCharacterRanges(new[] { new CharacterRange(0, 1) });
+                var probeBox = new RectangleF(0f, bounds.Top, bounds.Width, bounds.Height);
+                tailX -= InkLeftOf(g, probe, tail, font, probeBox);
+            }
+            if (prefix.Length > 0) DrawLayeredText(g, prefix, font, color, bounds, false);
+            int alpha = (int)Math.Round(color.A * lastAlpha);
+            if (alpha <= 0) return; // 还没露头的那一下不画，免得画出半像素灰边
+            if (alpha > 255) alpha = 255;
+            using (var brush = new SolidBrush(Color.FromArgb(alpha, color.R, color.G, color.B)))
+            using (var format = new StringFormat())
+            {
+                format.Alignment = StringAlignment.Near;
+                format.LineAlignment = StringAlignment.Center;
+                format.Trimming = StringTrimming.EllipsisCharacter;
+                format.FormatFlags = StringFormatFlags.NoWrap;
+                // 宽度给足：起点已经靠近行右端，用 bounds.Right - tailX 可能只剩几像素，
+                // 会触发省略号把刚冒出来的那个字剪掉。多出去的部分仍在胶囊内（右侧还留了内缩）。
+                var tailBox = new RectangleF(tailX, bounds.Top + rise, bounds.Width, bounds.Height);
+                g.DrawString(tail, font, brush, tailBox, format);
+            }
+        }
+
+        // 量"这一段文本在本次布局里第一列墨迹的 x"。用 MeasureCharacterRanges 而不是
+        // MeasureString：前者给的是 GDI+ 自己算出来的**该字符的位置**，与 DrawString 的排布一致；
+        // 后者会多算尾部空白（见 DrawLayeredTextFadingTail 的注释）。
+        // Region 持有 GDI+ 资源，这里每帧都会调用，必须释放。
+        private static float InkLeftOf(Graphics g, StringFormat format, string text, Font font, RectangleF box)
+        {
+            Region[] regions = g.MeasureCharacterRanges(text, font, box, format);
+            try
+            {
+                return regions[0].GetBounds(g).Left;
+            }
+            finally
+            {
+                for (int i = 0; i < regions.Length; i++) regions[i].Dispose();
+            }
+        }
     }
 
     internal sealed class OverlayForm : LayeredGlassForm
@@ -1714,6 +1791,9 @@ namespace VoxLeap
         private const int RecCaptionRowHeight = 30;
         private const int RecCaptionLeftInset = 22;  // 与第一行的红点左缘对齐
         private const int RecCaptionRightInset = 20;
+        // 最新那个字淡入时从下方浮上来的距离（淡完正好落位）。2px 是"看得出来在动、又不晃眼"
+        // 的量：行高 30px、字高约 13px，上下各留 8px 余量，浮上来不会碰到行边。
+        private const float RecFadeRisePx = 2f;
         // 胶囊宽度里与字幕文本无关的那些边：两侧玻璃内缩（LayeredGlassForm.SurfaceInset）、
         // 字幕左右内缩，再加 6px 量测余量——宽度用 GDI 的 TextRenderer 量、绘制走 GDI+ 的
         // DrawString，两者字宽有细微差异，宁可少放一个字，也不能让最新吐出的字被裁掉。
@@ -2167,17 +2247,22 @@ namespace VoxLeap
         {
             SyncLiveCaptionDisplay();
             if (_liveAnim.RowPixels < RecCaptionRowHeight) return;
-            DrawLayeredText(
-                g,
-                _liveCaptionDisplay,
-                LiveCaptionFont(),
-                Color.FromArgb(196, 242, 245, 247),
-                new RectangleF(
-                    surface.Left + RecCaptionLeftInset,
-                    surface.Top + RecRowHeight,
-                    surface.Width - RecCaptionLeftInset - RecCaptionRightInset,
-                    RecCaptionRowHeight),
-                false);
+            var box = new RectangleF(
+                surface.Left + RecCaptionLeftInset,
+                surface.Top + RecRowHeight,
+                surface.Width - RecCaptionLeftInset - RecCaptionRightInset,
+                RecCaptionRowHeight);
+            Color color = Color.FromArgb(196, 242, 245, 247);
+            // 最新那个字（一定是本行最后一个字：文本只追加，裁剪只砍左边）淡入 + 微上浮，
+            // 去掉"啪"一下整字全亮蹦出来的硬边。其余字一次画完，不受影响。
+            double alpha = _liveAnim.NewestCharAlpha;
+            if (alpha < 1.0)
+            {
+                float rise = (float)((1.0 - alpha) * RecFadeRisePx);
+                DrawLayeredTextFadingTail(g, _liveCaptionDisplay, LiveCaptionFont(), color, box, alpha, rise);
+                return;
+            }
+            DrawLayeredText(g, _liveCaptionDisplay, LiveCaptionFont(), color, box, false);
         }
 
         private void DrawBrandWave(Graphics g, float cx, float cy)

@@ -42,6 +42,7 @@ internal static class LiveCaptionAnimTest
         TestPacingLagStaysBounded();
         TestRevealCatchesUpWithBacklog();
         TestRowOnlyGrows();
+        TestNewestCharFadesIn();
         TestCompleteRevealFillsInstantly();
         Console.WriteLine("----");
         Console.WriteLine("passed=" + _passed + " failed=" + _failed);
@@ -308,6 +309,37 @@ internal static class LiveCaptionAnimTest
         Check("字幕行单调不减", monotonic);
         CheckEq("字幕行长满 30 像素", 30, a.RowPixels);
         CheckEq("整高 106", 106, a.Height);
+    }
+
+    // 逐字淡入：刚露头的那个字从 0 升到 1（宿主据此只把**本行最后一个字**画成半透明）。
+    // 关键不变量：淡入进度由动画自己的时钟推进，所以"字吐完、不再有新字"之后它必须自己
+    // 淡到全亮 —— 若改成"离上次吐字多久"来算，空闲时最后一个字会永远停在半透明。
+    private static void TestNewestCharFadesIn()
+    {
+        var a = new LiveCaptionAnim();
+        a.Reset(1920);
+        CheckEq("复位后没有字在淡入", 1.0, a.NewestCharAlpha);
+        a.SetTextLength(10, 1000, 0);
+        a.AdvanceReveal(200); // 一帧跨过整数边界：第一个字露头
+        Check("确实吐出了字", a.RevealedCount >= 1);
+        Check("刚露头的那个字从 0 开始淡入", a.NewestCharAlpha < 0.2);
+        a.AdvanceReveal(70); // 没跨过新的整数边界，淡到一半
+        Check("淡入过半时约 0.5", a.NewestCharAlpha > 0.3 && a.NewestCharAlpha < 0.8);
+        a.AdvanceReveal(150); // 这一帧又跨过边界 ⇒ 换成新字在淡入，仍须落在 0~1 之间
+        Check("换到下一个字时进度仍在 0~1", a.NewestCharAlpha >= 0.0 && a.NewestCharAlpha <= 1.0);
+
+        // 字吐完之后继续推进（录音还在跑、30fps 循环还在转）：必须自己淡完。
+        for (int f = 0; f < 200; f++) a.AdvanceReveal(33);
+        CheckEq("吐完之后空转也保持全亮", 1.0, a.NewestCharAlpha);
+
+        // 收尾：动画循环停了、时钟不再前进，未完成的淡入必须就地取消。
+        var b = new LiveCaptionAnim();
+        b.Reset(1920);
+        b.SetTextLength(10, 1000, 0);
+        b.AdvanceReveal(200);
+        Check("收尾前确实有字在半透明中", b.NewestCharAlpha < 1.0);
+        b.CompleteReveal();
+        CheckEq("收尾补齐时取消未完成的淡入", 1.0, b.NewestCharAlpha);
     }
 
     // 收尾立刻补齐，避免"字还没吐完录音就结束了"。

@@ -52,6 +52,9 @@ namespace VoxLeap
         private const double RateSmoothing = 0.45;
         private const int MinRateGapMs = 300;
         private const int MaxRateGapMs = 8000;
+        // 最新吐出来那个字的淡入时长。按说话速率铺开时约每 180ms 才出一个字，所以 140ms 的
+        // 淡入窗口里同一时刻最多一两个字在渐变；一次到达一大段（追赶）时多出来的字直接全亮。
+        public const int FadeInMs = 140;
         // 收敛吸附阈值：差值小于它就贴死目标。浮层每帧都要重绘一张 32 位位图，
         // 不能为了 0.04px 的差值让动画永远不结束。
         private const double SettleEpsilon = 0.05;
@@ -66,6 +69,11 @@ namespace VoxLeap
         private double _speechRatePerSecond; // 首选估计：累计字数 / 累计说话时长（不受停顿影响）
         private double _gapRatePerSecond;    // 备用估计：按到达间隔平滑（只在会话开头几秒用）
         private int _lastArrivalAt;          // 上一批文本到达的时刻（TickCount 毫秒），0 表示还没到过
+        // 内部单调时钟：只由 AdvanceReveal 的帧间隔累加。用它记"最新那个字是什么时候吐出来的"，
+        // 这样淡入进度完全不依赖宿主传进来的 TickCount，离线测试也能照样推进。
+        private double _clockMs;
+        private int _newestIndex;            // 最新吐出来的那个字的下标，-1 表示没有字在淡入
+        private double _newestAtMs;
 
         public LiveCaptionAnim()
         {
@@ -96,6 +104,9 @@ namespace VoxLeap
             _speechRatePerSecond = 0.0;
             _gapRatePerSecond = 0.0;
             _lastArrivalAt = 0;
+            _clockMs = 0.0;
+            _newestIndex = -1;
+            _newestAtMs = 0.0;
         }
 
         // 分段账本累计出来的**全文**长度、这一批到达的时刻（TickCount 毫秒）、以及当时累计的
@@ -137,9 +148,12 @@ namespace VoxLeap
         }
 
         // 收尾时立即补齐，避免"字还没吐完录音就结束了"。
+        // 同时取消未完成的淡入：收尾后动画循环就停了，时钟不再前进，留着会让最后一个字
+        // 永远停在半透明状态。
         public void CompleteReveal()
         {
             _revealed = _textLength;
+            _newestIndex = -1;
             if (_rowStarted) _rowProgress = 1.0;
         }
 
@@ -148,6 +162,7 @@ namespace VoxLeap
         {
             if (deltaMs > 0)
             {
+                _clockMs += deltaMs;
                 double backlog = _textLength - _revealed;
                 if (backlog > 0)
                 {
@@ -160,8 +175,17 @@ namespace VoxLeap
                     }
                     if (speed < RevealMinPerSecond) speed = RevealMinPerSecond;
                     if (speed > RevealMaxPerSecond) speed = RevealMaxPerSecond;
+                    double before = _revealed;
                     _revealed += speed * (deltaMs / 1000.0);
                     if (_revealed > _textLength) _revealed = _textLength;
+                    // 记下这一帧跨过的最后一个整数边界：那个字刚刚露出来，开始淡入。
+                    // 一帧跨过多个边界时只记最后一个 —— 追赶时多出来的字直接全亮，看不出来。
+                    int crossed = (int)_revealed;
+                    if (crossed > (int)before && crossed >= 1)
+                    {
+                        _newestIndex = crossed - 1;
+                        _newestAtMs = _clockMs;
+                    }
                     // 真正有字要吐了，字幕行才开始让位（此前保持 256×76）。
                     _rowStarted = true;
                 }
@@ -199,6 +223,19 @@ namespace VoxLeap
         public double RatePerSecond { get { return EffectiveRatePerSecond(); } }
         // 首选估计本身（0 = 说话时长还不够，正在用备用估计或起步值）。
         public double SpeechRatePerSecond { get { return _speechRatePerSecond; } }
+        // 最新那个字的淡入进度：0 = 刚露头（全透明），1 = 已经全亮。
+        // 宿主把它用在**整行最后一个字**上：那一定是刚刚露出来的那个（文本只追加、裁剪只砍左边）。
+        public double NewestCharAlpha
+        {
+            get
+            {
+                if (_newestIndex < 0) return 1.0;
+                double age = _clockMs - _newestAtMs;
+                if (age <= 0.0) return 0.0;
+                if (age >= FadeInMs) return 1.0;
+                return age / FadeInMs;
+            }
+        }
 
         private static double Ease(double current, double target, int deltaMs, double tauMs)
         {
