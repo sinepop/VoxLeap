@@ -143,6 +143,31 @@ namespace VoxLeap
         public int SegmentBytes { get { return _segmentBytes; } }
         public int Requests { get { return _requests; } }
 
+        // 按段序就绪的文本会交给它（在工作线程上调用，宿主负责真正注入）。
+        public Action<string> OnReadyText;
+        private readonly object _injectGate = new object();
+
+        // 已经往用户输入框里注入过文字。
+        // 一旦为真就**绝不能**再走整段回退——否则框里会先有半截流式内容，
+        // 回退路径又在后面追加整段，变成重复内容。
+        public bool HasInjected { get { return _ledger.Released > 0; } }
+
+        // 每有一段结算后调用：把按段序就绪的新文本取出来交给宿主注入。
+        // TakeReadyText 返回 null 表示整次流式已作废，此后不再注入任何东西。
+        // 整体串行化，避免两个段的完成回调交错着往输入框里写。
+        private void PumpReadyText()
+        {
+            Action<string> sink = OnReadyText;
+            if (sink == null) return;
+            lock (_injectGate)
+            {
+                string ready = _ledger.TakeReadyText();
+                if (string.IsNullOrEmpty(ready)) return;
+                try { sink(ready); }
+                catch (Exception ex) { _ledger.NoteFailure(_ledger.Released, "注入失败: " + ex.Message); }
+            }
+        }
+
         public void Dispatch(byte[] pcm)
         {
             if (pcm == null || pcm.Length == 0) return;
@@ -170,6 +195,7 @@ namespace VoxLeap
                     if (trimmed == null || trimmed.Length == 0)
                     {
                         _ledger.NoteEmpty(index);
+                        PumpReadyText();
                         return;
                     }
                 }
@@ -181,9 +207,10 @@ namespace VoxLeap
                     _ledger.NoteFailure(index, string.IsNullOrEmpty(r.Error) ? ("HTTP " + r.HttpStatus) : r.Error);
                     return;
                 }
-                if (string.IsNullOrEmpty(r.Text)) { _ledger.NoteEmpty(index); return; }
+                if (string.IsNullOrEmpty(r.Text)) { _ledger.NoteEmpty(index); PumpReadyText(); return; }
                 Interlocked.Increment(ref _requests);
                 _ledger.NoteText(index, r.Text);
+                PumpReadyText();
             }
             catch (Exception ex)
             {

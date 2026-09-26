@@ -2447,6 +2447,8 @@ namespace VoxLeap
         private AsrSession _asrSession;
         // 边说边送会话：仅在开启 streamingSegments 时非空。waveIn 线程会读它，故 volatile。
         private volatile StreamingSegmentRunner _streamRunner;
+        // 合成修饰键窗口的截止时间，见 InjectWithModifierRelease。
+        private DateTime _syntheticModifierUntil = DateTime.MinValue;
         // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
         private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
@@ -2471,6 +2473,10 @@ namespace VoxLeap
             _overlay.HoldKeyStillDown = delegate
             {
                 if (IsToggleMode(_cfg)) return true; // toggle 模式不探测“抬起”，避免误终止
+                // 合成修饰键窗口内必须仍然回答"按住"：注入文字前我们会伪造一次该修饰键的
+                // 抬起，而 SendInput 会改变 GetAsyncKeyState 的结果。不挡住的话，第一次
+                // 有字注入就会被误判成松手，录音当场结束。
+                if (DateTime.Now < _syntheticModifierUntil) return true;
                 return KeyDown(GetHotkeyVk(_cfg));
             };
             // 静音自动停止：分段器只回答"安静了多久"，阈值与开关都来自配置。默认关闭。
@@ -2800,7 +2806,17 @@ namespace VoxLeap
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
                 // 边说边送会话：默认关闭时为 null，整条流式链路完全不存在。
-                _streamRunner = _cfg.StreamingSegments ? new StreamingSegmentRunner(_cfg) : null;
+                if (_cfg.StreamingSegments)
+                {
+                    StreamingSegmentRunner runner = new StreamingSegmentRunner(_cfg);
+                    // 分段结果按段序就绪 → 立刻写进当前输入框。这就是"边说边跳字"。
+                    runner.OnReadyText = delegate(string chunk) { InjectWithModifierRelease(chunk); };
+                    _streamRunner = runner;
+                }
+                else
+                {
+                    _streamRunner = null;
+                }
                 Log.Write("开始录音");
             }
             catch (Exception ex)
@@ -2911,7 +2927,15 @@ namespace VoxLeap
             try
             {
                 res = stream == null ? null : CollectStreamedTranscript(stream);
-                if (res == null) res = AsrClient.Transcribe(_cfg, wav, session);
+                // 已经注入过内容就**不能**再回退整段：否则输入框里先有半截流式文字、
+                // 回退路径又在后面追加整段，变成重复内容。宁可这次没有结果，也不能写坏输入框。
+                if (res == null && (stream == null || !stream.HasInjected)) res = AsrClient.Transcribe(_cfg, wav, session);
+                if (res == null)
+                {
+                    res = new AsrResult();
+                    res.Error = "流式识别中断，输入框内已有部分内容，请检查";
+                    Log.Write("流式分段中断且已注入过内容：跳过整段回退，避免重复");
+                }
                 if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
                 {
                     ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();
@@ -3102,6 +3126,63 @@ namespace VoxLeap
 
         // readyMs：从松开热键到"文本就绪"的毫秒数，只为自动输入的成功提示附上真实等待时间。
         // 审阅路径传 -1：用户审阅了多久与识别延迟无关，混进来会得到一个无意义的巨大数字。
+        // 热键是右 Ctrl / 右 Alt / 右 Shift 时返回该修饰键的 VK。
+        // Caps Lock 不是修饰键（按住它不影响其它按键的含义），返回 -1。
+        private static int HotkeyModifierVk(Config cfg)
+        {
+            int vk = GetHotkeyVk(cfg);
+            if (vk == Native.VK_CAPITAL) return -1;
+            return vk;
+        }
+
+        // 往输入框里写字。热键是修饰键且此刻物理按下时，先伪造一次该修饰键的"抬起"再注入。
+        //
+        // 为什么必须这样：按住右 Ctrl 说话时，物理键真的按着，目标程序就真的看到 Ctrl 按下，
+        // 于是注入的文字会被当成 Ctrl+字符 快捷键（全选/粘贴/关闭标签/撤销），而不是打字。
+        //
+        // 三处必须同时成立，缺一个都会出事：
+        //  1. 抬起与按下成对、且放在 finally 里——任何异常都不能让目标程序停留在
+        //     "Ctrl 已抬起"的假状态，那会变成粘键；
+        //  2. 窗口内必须让本程序的"松手即结束录音"判断闭嘴（见 HoldKeyStillDown），
+        //     因为 SendInput 会改变 GetAsyncKeyState 的结果；
+        //  3. 只在热键确实是修饰键、且此刻物理按下时才做（Caps Lock 与 toggle 模式都不需要）。
+        private void InjectWithModifierRelease(string text)
+        {
+            int mod = HotkeyModifierVk(_cfg);
+            bool fake = mod > 0 && !IsToggleMode(_cfg) && KeyDown(mod);
+            if (!fake)
+            {
+                InjectText(text, 0);
+                return;
+            }
+            _syntheticModifierUntil = DateTime.Now.AddSeconds(10); // 覆盖整段注入
+            SendModifier(mod, false);
+            try
+            {
+                InjectText(text, 0);
+            }
+            finally
+            {
+                SendModifier(mod, true);
+                // 注入结束后再留一小段，吸收掉可能还在队列里的一次轮询；
+                // 之后窗口自然过期，真实的松手会被立刻看到。
+                _syntheticModifierUntil = DateTime.Now.AddMilliseconds(200);
+            }
+        }
+
+        // 单独发一个修饰键的按下/抬起事件。这里不做任何多余的事：加锁、分配、日志都可能抛异常，
+        // 而这条路径"必须走到"——它就是按下与抬起成对的那一半。
+        private static void SendModifier(int vk, bool down)
+        {
+            try
+            {
+                Native.INPUT[] inputs = new Native.INPUT[1];
+                inputs[0] = VkInput((ushort)vk, down ? 0u : Native.KEYEVENTF_KEYUP);
+                Native.SendInput(1, inputs, Marshal.SizeOf(typeof(Native.INPUT)));
+            }
+            catch { }
+        }
+
         private void InjectText(string text, long readyMs)
         {
             string waitSuffix = readyMs > 0 ? " · " + (readyMs / 1000.0).ToString("0.0") + "s" : "";
