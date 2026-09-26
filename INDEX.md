@@ -1,7 +1,7 @@
 # INDEX.md — 声跃 VoxLeap · 文件索引
 
 > **AI 进入本项目先读此文件定位，再精准读目标文件，禁止盲扫。**
-> 新增文件时在此补一行职责说明。项目一句话：Windows 系统级「按住说话」语音输入工具；当前阶段 = 浏览器原型 + ASR 基准评测 + 视觉方向重构。
+> 新增文件时在此补一行职责说明。项目一句话：Windows 系统级「按住说话」语音输入工具；当前可交付的是**个人自用运行版 v0.3.1**（`src/app-v0/`，边说边出字），商用 MVP 仍在 Phase 0 文档验证。
 
 ## 状态看板（每次会话先看这三个）
 
@@ -10,6 +10,8 @@
 | `TODO.md` | 待办清单 |
 | `PROGRESS.md` | 已完成批次记录（决策落盘处，已有结论不重议） |
 | `AGENTS.md` | 项目内 agent 约定 |
+
+对外首页是 `README.md`（含下载入口）；运行版使用与实现说明在 `src/app-v0/README.md`。
 
 ## 当前方向（已拍板，不重议）
 
@@ -27,20 +29,17 @@
 
 | 路径 | 职责 |
 |---|---|
-| `assets/` (2 文件) | Logo 波形主资产 + 溯源说明 |
-| `assets/brand/` (2 文件) | 品牌 Logo 资产（SVG + 溯源说明） |
+| `assets/brand/` (4 文件) | 品牌 Logo 波形主资产（母版 SVG + 深色版 + manifest + 溯源说明） |
 | `docs/` (9 文件) | 文档目录（01-PRD 至 09-交接归档） |
 | `prototype/` (4 文件) | 可运行浏览器原型（index.html + app.js） |
 | `scripts/` (1 文件) | 工具脚本 |
-| `src/` (7 文件) | 源码目录（含 app-v0 旧方向） |
-| `src/app-v0/` (7 文件) | v0 应用骨架（已否决旧方向，留参考） |
-| `tests/` (7 文件) | ASR 评测（asr-eval + fixtures 语料） |
-| `tests/app-core-test/` (2 文件) | 应用核心单元测试（C#） |
+| `src/app-v0/` (13 文件) | **个人自用运行版源码**：WinForms 单文件程序 + 构建脚本 + 使用说明 |
+| `tests/app-core-test/` (6 文件) | 应用核心单元测试（C#，六个可独立运行的入口） |
 | `tests/asr-eval/` (4 文件) | ASR 基准评测脚本与评分 |
 | `tests/fixtures/` (1 文件) | 评测语料（ASR 输入输出） |
 | `AGENTS.md` | 项目内 agent 约定 |
 | `PROGRESS.md` | 已完成批次记录（决策落盘处，已有结论不重议） |
-| `README.md` | 项目说明 |
+| `README.md` | 对外首页：现状、下载入口、产品原则、文档索引 |
 | `TODO.md` | 待办清单 |
 | `docs/01-PRD.md` | 产品需求文档（PRD） |
 | `docs/02-UX与视觉规范.md` | UX 与视觉规范 |
@@ -56,4 +55,23 @@
 | `prototype/refinement-v4.css` | 原型 v0.4 样式（脉冲方块/极光） |
 | `prototype/styles.css` | 原型基础样式 |
 | `scripts/setup-windows-dev.ps1` | Windows 开发环境初始化脚本 |
+| `src/app-v0/AiProviders.cs` | ASR 与整理 provider 工厂（StepFun SSE / OpenAI 兼容）与协议实现 |
+| `src/app-v0/App.cs` | 单文件主程序：录音、分段调度、玻璃浮层（声纹+字幕）、托盘、审阅与注入 |
+| `src/app-v0/LatencyTrace.cs` | 延迟埋点与日志格式（分段账本、松手后耗时、判定口径） |
+| `src/app-v0/LiveCaptionAnim.cs` | 录音期字幕动画纯算术（宽度缓动、按说话速率逐字铺开、最新字淡入）※ 可离线单测 |
+| `src/app-v0/README.md` | 运行版使用与实现说明（设置项、流式分段、字幕动画、验证方式） |
+| `src/app-v0/SettingsCore.cs` | 设置读写与校验（DPAPI 加密、原子替换、旧版明文迁移） |
+| `src/app-v0/SettingsForm.cs` | 设置窗口（服务、热键、VAD、AI 整理、超时） |
+| `src/app-v0/SpeechSegmenter.cs` | 语音分段器：静音分界、软/硬上限兜底、累计说话时长 |
+| `src/app-v0/StreamingAsr.cs` | 边说边送：分段账本、派发与"任一段失败即整段回退" |
+| `src/app-v0/VoxleapCore.cs` | 核心纯逻辑（整理安全门、注入策略、诊断文案） |
+| `src/app-v0/build.cmd` | 零安装构建：调用系统自带 `csc.exe` 输出到 `%LOCALAPPDATA%\VoxLeap` |
+| `src/app-v0/settings.template.json` | 配置模板（不含密钥，随发布包分发） |
+| `src/app-v0/voxleap.ico` | 托盘与快捷方式图标（品牌五方块） |
+| `tests/app-core-test/LatencyTraceTest.cs` | 延迟账本纯逻辑测试 |
+| `tests/app-core-test/LiveCaptionAnimTest.cs` | 字幕动画纯逻辑测试（宽度上限、逐字铺开、淡入、滞后有界） |
+| `tests/app-core-test/SettingsCoreTest.cs` | 设置读写与校验测试 |
+| `tests/app-core-test/SpeechSegmenterTest.cs` | 分段器测试（静音分界、软硬上限、说话时长） |
+| `tests/app-core-test/StreamingAsrTest.cs` | 流式分段账本测试（落位、拼接、失败回退） |
+| `tests/app-core-test/VoxleapCoreTest.cs` | 核心纯逻辑测试（安全门、注入策略） |
 <!-- auto:index:end -->
