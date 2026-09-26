@@ -2457,9 +2457,8 @@ namespace VoxLeap
         // 本会话是否已经把原文"边说边"注入过输入框。
         // 收尾逻辑跑在另一个方法（UI 线程的完成回调）里，拿不到 TranscribeWorker 的局部
         // 变量，所以用字段传递：它决定收尾还能不能写入（写入就会重复）。
-        private volatile bool _streamInjected;
-        // 真正注入进输入框的那串原文。收尾时拿它逐字校验后才敢替换（见 ReplaceInjected）。
-        private volatile string _streamInjectedRaw;
+        // 本会话是否走了边说边送（流式）。为真时输入框就是审阅面，不再弹审阅卡片。
+        private volatile bool _streamUsed;
         // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
         private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
@@ -2816,14 +2815,19 @@ namespace VoxLeap
                 _recordStart = DateTime.Now;
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
-                _streamInjected = false;
-                _streamInjectedRaw = null;
+                _streamUsed = false;
                 // 边说边送会话：默认关闭时为 null，整条流式链路完全不存在。
                 if (_cfg.StreamingSegments)
                 {
                     StreamingSegmentRunner runner = new StreamingSegmentRunner(_cfg);
-                    // 分段结果按段序就绪 → 立刻写进当前输入框。这就是"边说边跳字"。
-                    runner.OnReadyText = delegate(string chunk) { InjectWithModifierRelease(chunk); };
+                    // 这里**故意不设置 OnReadyText**：说话期间不再往输入框注入任何东西。
+                    //
+                    // 曾经在这里接过"伪造修饰键抬起 + 注入 + 补回按下"，真机上在装有中文输入法的
+                    // 输入框里会把字符送进输入法的拼写缓存而不是上屏，候选框乱跳，最终把输入法
+                    // 卡死，用户只能重启输入法。教训：按住修饰键的那段时间，不要碰输入框。
+                    //
+                    // 现在分段结果只用来在松手后拼出完整文本，由收尾路径一次性写入——那时热键
+                    // 已经松开，纯键盘注入即可，不需要伪造修饰键，也没有 Ctrl+字符 的问题。
                     _streamRunner = runner;
                 }
                 else
@@ -2952,8 +2956,12 @@ namespace VoxLeap
                     res.Error = "流式识别中断，输入框内已有部分内容，请检查";
                     Log.Write("流式分段中断且已注入过内容：跳过整段回退，避免重复");
                 }
-                _streamInjected = stream != null && stream.HasInjected;
-                _streamInjectedRaw = _streamInjected ? stream.Ledger.ReleasedText : null;
+                // 说明：这里**不再**在说话期间往输入框注入任何东西。
+                // 曾经用过"伪造修饰键抬起 + 注入 + 补回按下"，实测在装有中文输入法的输入框里
+                // 会把字符送进输入法的拼写缓存而不是上屏，输入法候选框乱跳，甚至把输入法卡死。
+                // 现在说话期间只把文字显示在浮层上，完全不碰键盘与输入框；等松手、整理完成后再
+                // 一次性写入。因此不需要伪造修饰键，也不需要 Shift+左选/Ctrl+C 那套回读校验。
+                _streamUsed = stream != null;
                 if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
                 {
                     ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();
@@ -3038,35 +3046,23 @@ namespace VoxLeap
                     {
                         if (!string.IsNullOrEmpty(res.OrganizeError))
                             _toast.ShowToast("AI 整理失败，已使用原文");
-                        // 边说边跳字：原文已经在输入框里了，**输入框本身就是审阅面**，
-                        // 不再弹审阅卡片。有整理版就把框里那段原文校验后换掉，没有就保持原文。
-                        if (_streamInjected)
+                        // 边走边送：说话期间文字已经在浮层上显示过了，**输入框本身就是审阅面**，
+                        // 所以这里一次性写入最终文本（整理成功就是整理版），不再弹审阅卡片。
+                        // 送到这里的是纯键盘注入，不伪造任何修饰键——此刻热键已经松开，
+                        // 不存在 Ctrl+字符 的问题，因此也完全不去干扰输入法。
+                        if (_streamUsed)
                         {
                             _state = State.Idle;
-                            if (!string.IsNullOrEmpty(res.OrganizedText) && text != _streamInjectedRaw)
-                            {
-                                try { ReplaceInjected(_streamInjectedRaw, text); }
-                                catch (Exception ex) { Log.Write("替换整理版失败: " + ex.Message); }
-                                finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
-                            }
+                            try { InjectText(text, readyMs); }
+                            finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
                             LogSessionTrace(trace);
                         }
                         else if (_cfg.AutoInsert)
                         {
                             // 自动输入模式（用户主动开启）：跳过审阅，直接写入按下热键时捕获的目标。
-                            // 但边说边跳字已经写过一遍原文了，这里再写就是在原文后面追加整段——
-                            // 变成重复内容。在做完"校验后替换"之前，这里一律拒绝。
-                            if (_streamInjected)
-                            {
-                                _toast.ShowToast("原文已边说边写入；整理版替换尚未实现，未重复写入");
-                                Log.Write("跳过自动写入: 已有边说边注入内容, 避免重复");
-                            }
-                            else
-                            {
-                                _state = State.Idle;
-                                try { InjectText(text, readyMs); }
-                                finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
-                            }
+                            _state = State.Idle;
+                            try { InjectText(text, readyMs); }
+                            finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
                             LogSessionTrace(trace);
                         }
                         else
@@ -3078,13 +3074,6 @@ namespace VoxLeap
                             var review = new ReviewForm(text, originalText, meta,
                                 delegate(string editedText)
                                 {
-                                    // 同上：原文已经边说边写进输入框，这里再写就是重复。
-                                    if (_streamInjected)
-                                    {
-                                        _toast.ShowToast("原文已边说边写入；整理版替换尚未实现，未重复写入");
-                                        Log.Write("跳过审阅写入: 已有边说边注入内容, 避免重复");
-                                        return;
-                                    }
                                     try { InjectText(editedText, -1); }
                                     finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
                                 },
@@ -3206,6 +3195,9 @@ namespace VoxLeap
             catch { }
         }
 
+        // 【已弃用，无调用方】Shift+左选 / Ctrl+C 回读同样是与输入法抢键盘状态：Shift 本身
+        // 就是输入法的中英切换键，回读还永远是空（字符没上屏，复制不到）。**不要重新接上**，
+        // 下次清理会删除。SendHoldTap / SendCtrlC 一并弃用。
         // 校验后替换：把输入框里"我们边说边注入的那段原文"换成整理版。
         //
         // 为什么必须校验：从注入到整理完成中间隔了好几秒，用户完全可能已经自己改过错、
@@ -3276,6 +3268,9 @@ namespace VoxLeap
             return vk;
         }
 
+        // 【已弃用，无调用方】InjectWithModifierRelease / SendModifier / HotkeyModifierVk
+        // 在真机（装有中文输入法的输入框）上把字符送进了输入法的拼写缓存而不是上屏，
+        // 候选框乱跳，最终把输入法卡死。**不要重新接上**，下次清理会删除。
         // 往输入框里写字。热键是修饰键且此刻物理按下时，先伪造一次该修饰键的"抬起"再注入。
         //
         // 为什么必须这样：按住右 Ctrl 说话时，物理键真的按着，目标程序就真的看到 Ctrl 按下，
