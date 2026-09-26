@@ -2449,6 +2449,10 @@ namespace VoxLeap
         private volatile StreamingSegmentRunner _streamRunner;
         // 合成修饰键窗口的截止时间，见 InjectWithModifierRelease。
         private DateTime _syntheticModifierUntil = DateTime.MinValue;
+        // 本会话是否已经把原文"边说边"注入过输入框。
+        // 收尾逻辑跑在另一个方法（UI 线程的完成回调）里，拿不到 TranscribeWorker 的局部
+        // 变量，所以用字段传递：它决定收尾还能不能写入（写入就会重复）。
+        private volatile bool _streamInjected;
         // 当前会话的延迟分解。在按下热键时创建（时间轴 0 点），随会话传给 ASR provider。
         private LatencyTrace _trace;
         private System.Windows.Forms.Timer _cancelWatchdog;
@@ -2805,6 +2809,7 @@ namespace VoxLeap
                 _recordStart = DateTime.Now;
                 _state = State.Recording;
                 _overlay.ShowRecording(fg);
+                _streamInjected = false;
                 // 边说边送会话：默认关闭时为 null，整条流式链路完全不存在。
                 if (_cfg.StreamingSegments)
                 {
@@ -2936,6 +2941,7 @@ namespace VoxLeap
                     res.Error = "流式识别中断，输入框内已有部分内容，请检查";
                     Log.Write("流式分段中断且已注入过内容：跳过整段回退，避免重复");
                 }
+                _streamInjected = stream != null && stream.HasInjected;
                 if (res.Ok && _cfg.AiOrganize && !session.Cancelled)
                 {
                     ITextTransformProvider transformer = new OpenAiCompatibleTextTransformProvider();
@@ -3023,9 +3029,19 @@ namespace VoxLeap
                         if (_cfg.AutoInsert)
                         {
                             // 自动输入模式（用户主动开启）：跳过审阅，直接写入按下热键时捕获的目标。
-                            _state = State.Idle;
-                            try { InjectText(text, readyMs); }
-                            finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
+                            // 但边说边跳字已经写过一遍原文了，这里再写就是在原文后面追加整段——
+                            // 变成重复内容。在做完"校验后替换"之前，这里一律拒绝。
+                            if (_streamInjected)
+                            {
+                                _toast.ShowToast("原文已边说边写入；整理版替换尚未实现，未重复写入");
+                                Log.Write("跳过自动写入: 已有边说边注入内容, 避免重复");
+                            }
+                            else
+                            {
+                                _state = State.Idle;
+                                try { InjectText(text, readyMs); }
+                                finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
+                            }
                             LogSessionTrace(trace);
                         }
                         else
@@ -3037,6 +3053,13 @@ namespace VoxLeap
                             var review = new ReviewForm(text, originalText, meta,
                                 delegate(string editedText)
                                 {
+                                    // 同上：原文已经边说边写进输入框，这里再写就是重复。
+                                    if (_streamInjected)
+                                    {
+                                        _toast.ShowToast("原文已边说边写入；整理版替换尚未实现，未重复写入");
+                                        Log.Write("跳过审阅写入: 已有边说边注入内容, 避免重复");
+                                        return;
+                                    }
                                     try { InjectText(editedText, -1); }
                                     finally { if (trace != null) trace.Mark(LatencyTrace.Injected); }
                                 },
