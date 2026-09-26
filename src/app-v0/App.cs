@@ -119,6 +119,10 @@ namespace VoxLeap
         public bool EnableVad = true;
         public int VadThreshold = 450;
         public int VadPaddingMs = 180;
+        // 静音自动停止。默认关闭，与"默认审阅后输入""默认不自动输入"同属收紧默认：
+        // 开启后不必一直按住热键，连续静音超过 AutoStopSilenceMs 即自动结束并开始识别。
+        public bool AutoStopOnSilence = false;
+        public int AutoStopSilenceMs = 1200;
         public bool AiOrganize = false;
         public string OrganizerBaseUrl = "";
         public string OrganizerEndpoint = "/chat/completions";
@@ -163,6 +167,8 @@ namespace VoxLeap
             EnableVad = other.EnableVad;
             VadThreshold = other.VadThreshold;
             VadPaddingMs = other.VadPaddingMs;
+            AutoStopOnSilence = other.AutoStopOnSilence;
+            AutoStopSilenceMs = other.AutoStopSilenceMs;
             AiOrganize = other.AiOrganize;
             OrganizerBaseUrl = other.OrganizerBaseUrl;
             OrganizerEndpoint = other.OrganizerEndpoint;
@@ -435,6 +441,16 @@ namespace VoxLeap
                 if (_segmenter == null) return;
                 _segmenter.NoteAudioBytes(bytesRecorded);
                 _segmenter.Feed(rmsRaw);
+            }
+        }
+
+        // 供录音计时器轮询：静音是否已持续到该收尾。只读查询，不改动影子记录状态。
+        public static bool ShouldAutoStopOnSilence(int endSilenceMs)
+        {
+            lock (_segmenterGate)
+            {
+                if (_segmenter == null) return false;
+                return _segmenter.ShouldAutoStop(endSilenceMs);
             }
         }
 
@@ -1565,6 +1581,9 @@ namespace VoxLeap
         public Action MaxDurationReached; // 录音到上限时的回调（由宿主定义为转存并继续转写）
         // 对抗审查 P1 键态探测：宿主注入“热键物理上是否仍按住”，用于 keyup 丢失（Alt+Tab/UAC/安全桌面/ RDP）自动收尾。
         public Func<bool> HoldKeyStillDown;
+        // 静音自动停止：宿主注入"此刻是否该因静音而收尾"。返回 true 时走与录音上限/keyup 丢失
+        // 完全相同的收尾路径（含 auto-repeat 抑制），因此不新增一条并行状态机。
+        public Func<bool> ShouldAutoStopOnSilence;
         private DateTime _holdKeyLiftedAt = DateTime.MinValue;
         private bool _holdKeyWasDownOnce;
         private static readonly int[] WaveLags = new[] { 3, 1, 0, 2, 4 };
@@ -1705,7 +1724,14 @@ namespace VoxLeap
             {
                 // cap: MaxRecordMs>0 用配置值；0 时也走 10 分钟安全闸，避免 keyup 丢失时无限录音。
                 long capMs = MaxRecordMs > 0 ? MaxRecordMs : RecordSafeguardMs;
-                if (totalSeconds * 1000L >= capMs)
+                // 静音自动停止必须排在第一个分支：后面的 keyup 探测分支只要 _holdKeyWasDownOnce
+                // 为真就会进入，写成 else-if 放它后面将永远得不到执行机会。
+                if (ShouldAutoStopOnSilence != null && ShouldAutoStopOnSilence())
+                {
+                    _recording = false; // 防重入
+                    if (MaxDurationReached != null) MaxDurationReached();
+                }
+                else if (totalSeconds * 1000L >= capMs)
                 {
                     _recording = false; // 防重入
                     if (MaxDurationReached != null) MaxDurationReached();
@@ -2343,6 +2369,13 @@ namespace VoxLeap
             {
                 if (IsToggleMode(_cfg)) return true; // toggle 模式不探测“抬起”，避免误终止
                 return KeyDown(GetHotkeyVk(_cfg));
+            };
+            // 静音自动停止：分段器只回答"安静了多久"，阈值与开关都来自配置。默认关闭。
+            // 关闭时这里只是一次委托调用就返回，不触碰分段器的锁。
+            _overlay.ShouldAutoStopOnSilence = delegate
+            {
+                if (!_cfg.AutoStopOnSilence) return false;
+                return Recorder.ShouldAutoStopOnSilence(_cfg.AutoStopSilenceMs);
             };
             _toast = new ToastForm();
 

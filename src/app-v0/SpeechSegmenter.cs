@@ -87,6 +87,17 @@ namespace VoxLeap
             _expectedBytes += (long)_frameMs * BytesPerMs;
         }
 
+        // 非破坏性查询：此刻是否满足自动收尾条件。宿主每 100ms 轮询一次，因此这里不能改变
+        // 任何状态；也不复用影子模式的 _endFired —— 那个标记按构造时的阈值置位，而调用方
+        // 传入的阈值来自配置，两者可能不同，复用会导致"阈值调大后永远收不了尾"。
+        public bool ShouldAutoStop(int endSilenceMs)
+        {
+            if (endSilenceMs <= 0) return false;
+            if (_voiced) return false;                       // 正在说话
+            if (_speechMsTotal < _minSpeechMs) return false; // 一句话都还没说过，不能收尾
+            return _silenceRunMs >= endSilenceMs;
+        }
+
         public Signal Feed(double rms)
         {
             _frames++;

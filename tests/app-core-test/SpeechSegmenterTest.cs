@@ -55,6 +55,7 @@ internal static class SpeechSegmenterRunner
         TestFinishRecordsTrailingRun();
         TestTailSpeech();
         TestLogLine();
+        TestShouldAutoStop();
 
         Console.WriteLine("----");
         Console.WriteLine("passed=" + _passed + " failed=" + _failed);
@@ -192,6 +193,50 @@ internal static class SpeechSegmenterRunner
         Feed(afterSplit, 10, Voiced, c3);
         Feed(afterSplit, 8, Silent, c3);
         CheckEq("分界已发走后尾段为空", afterSplit.Finish(), 0);
+    }
+
+    private static void TestShouldAutoStop()
+    {
+        // 一句话都没说过：即使长时间静音也不能收尾，否则误按热键会立刻结束。
+        var mute = New();
+        var cm = new int[3];
+        Feed(mute, 50, Silent, cm);
+        Check("从未说话时不自动收尾", !mute.ShouldAutoStop(1200));
+
+        // 正常节奏：说话 1s 后静音 500ms。
+        var seg = New();
+        var c = new int[3];
+        Feed(seg, 10, Voiced, c);
+        Feed(seg, 5, Silent, c);
+        Check("静音 500ms 未达 1200ms 阈值", !seg.ShouldAutoStop(1200));
+        Check("静音 500ms 已达 500ms 阈值", seg.ShouldAutoStop(500));
+
+        // 正在说话时永不收尾。
+        var talking = New();
+        var ct = new int[3];
+        Feed(talking, 10, Voiced, ct);
+        Check("正在说话时不自动收尾", !talking.ShouldAutoStop(300));
+
+        // 阈值 <= 0 视为关闭。
+        Check("阈值 0 视为关闭", !seg.ShouldAutoStop(0));
+
+        // 查询必须无副作用：宿主每 100ms 调一次，绝不能污染影子记录。
+        int runsBefore = seg.SilenceRuns.Count;
+        int autoStopsBefore = seg.AutoStops;
+        for (int i = 0; i < 20; i++) seg.ShouldAutoStop(1200);
+        CheckEq("查询不改变静音游程记录", seg.SilenceRuns.Count, runsBefore);
+        CheckEq("查询不改变自动收尾计数", seg.AutoStops, autoStopsBefore);
+
+        // 关键回归：影子 Feed 已按构造阈值置位 _endFired，但宿主阈值可能更大。
+        // 若查询复用了 _endFired，配置调大后就会永远收不了尾。
+        var late = New();
+        var cl = new int[3];
+        Feed(late, 10, Voiced, cl);
+        Feed(late, 12, Silent, cl); // 1200ms：影子已报 AutoStop
+        CheckEq("影子已按 1200ms 收尾", cl[2], 1);
+        Check("影子的收尾不阻挡更大的阈值", !late.ShouldAutoStop(1500));
+        Feed(late, 4, Silent, cl);  // 静音累计 1600ms
+        Check("静音继续增长后更大阈值也能收尾", late.ShouldAutoStop(1500));
     }
 
     private static void TestLogLine()

@@ -315,6 +315,8 @@ namespace VoxLeap
         private NumericUpDown _timeoutSeconds;
         private NumericUpDown _vadThreshold;
         private NumericUpDown _vadPaddingMs;
+        private CheckBox _autoStopBox;
+        private NumericUpDown _autoStopSilenceMs;
         private TextBox _organizerBaseUrlBox;
         private TextBox _organizerEndpointBox;
         private TextBox _organizerModelBox;
@@ -667,6 +669,18 @@ namespace VoxLeap
             _vadPaddingMs = BuildNumeric(0, 2000, "VAD 前后保留毫秒");
             AddField(advanced, "VAD 缓冲", WrapWithSuffix(_vadPaddingMs, "毫秒"), null, false);
 
+            _autoStopBox = new CheckBox();
+            _autoStopBox.AutoSize = true;
+            _autoStopBox.Font = SettingsTheme.Body;
+            _autoStopBox.Text = "说话停下后自动结束录音";
+            AddField(advanced, "静音自动停止", _autoStopBox,
+                "默认关闭。开启后，连续静音超过下方时长即自动结束录音并开始识别，说完话不必再按着热键。", false);
+
+            _autoStopSilenceMs = BuildNumeric(300, 10000, "静音多久后自动结束");
+            _autoStopSilenceMs.Enabled = false;
+            _autoStopBox.CheckedChanged += delegate { _autoStopSilenceMs.Enabled = _autoStopBox.Checked; };
+            AddField(advanced, "静音时长", WrapWithSuffix(_autoStopSilenceMs, "毫秒"), null, false);
+
             _aiOrganizeBox = new CheckBox();
             _aiOrganizeBox.AutoSize = true;
             _aiOrganizeBox.Font = SettingsTheme.Body;
@@ -932,6 +946,8 @@ namespace VoxLeap
             _enableVadBox.Checked = cfg.EnableVad;
             _vadThreshold.Value = Clamp(_vadThreshold, cfg.VadThreshold);
             _vadPaddingMs.Value = Clamp(_vadPaddingMs, cfg.VadPaddingMs);
+            _autoStopSilenceMs.Value = Clamp(_autoStopSilenceMs, cfg.AutoStopSilenceMs);
+            _autoStopBox.Checked = cfg.AutoStopOnSilence;
             _aiOrganizeBox.Checked = cfg.AiOrganize;
             _organizerBaseUrlBox.Text = cfg.OrganizerBaseUrl;
             _organizerEndpointBox.Text = cfg.OrganizerEndpoint;
@@ -1131,6 +1147,8 @@ namespace VoxLeap
             updated.EnableVad = _enableVadBox.Checked;
             updated.VadThreshold = (int)_vadThreshold.Value;
             updated.VadPaddingMs = (int)_vadPaddingMs.Value;
+            updated.AutoStopOnSilence = _autoStopBox.Checked;
+            updated.AutoStopSilenceMs = (int)_autoStopSilenceMs.Value;
             updated.AiOrganize = _aiOrganizeBox.Checked;
             updated.OrganizerBaseUrl = _organizerBaseUrlBox.Text;
             updated.OrganizerEndpoint = _organizerEndpointBox.Text;

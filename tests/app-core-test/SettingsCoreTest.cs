@@ -37,6 +37,7 @@ namespace VoxLeap
                 TestHotkeyValidation();
                 TestHotkeyDefaultsWhenMissing();
                 TestTransportValidation();
+                TestAutoStopConfig();
                 TestConnectionDiagnosis();
                 TestDiagnosticAudio();
                 TestLegacyMigrationAndBackupRecovery();
@@ -160,6 +161,46 @@ namespace VoxLeap
             denied.HttpStatus = 401;
             Assert(ConnectionDiagnosis.Describe(denied, new Config()).IndexOf("API Key") >= 0,
                 "401 应提示检查 API Key");
+        }
+
+        private static void TestAutoStopConfig()
+        {
+            var enabled = new Config();
+            enabled.ApiKey = "test-key";
+            enabled.AutoStopOnSilence = true;
+            enabled.AutoStopSilenceMs = 1200;
+            Assert(ConfigValidator.Validate(enabled).Ok, "合法静音自动停止配置应通过校验");
+
+            var tooFast = new Config();
+            tooFast.ApiKey = "test-key";
+            tooFast.AutoStopSilenceMs = 100;
+            Assert(!ConfigValidator.Validate(tooFast).Ok, "过短的静音时长应被拒绝");
+
+            var tooSlow = new Config();
+            tooSlow.ApiKey = "test-key";
+            tooSlow.AutoStopSilenceMs = 20000;
+            Assert(!ConfigValidator.Validate(tooSlow).Ok, "过长的静音时长应被拒绝");
+
+            // 默认关闭属于"默认收紧"产品约束的一部分，不能被无意改成默认开启。
+            Assert(!new Config().AutoStopOnSilence, "静音自动停止默认应关闭");
+
+            var cfg = new Config();
+            cfg.ApiKey = "test-key";
+            cfg.AutoStopOnSilence = true;
+            cfg.AutoStopSilenceMs = 900;
+            string json = ConfigStore.SerializeToJson(cfg, new FakeProtector());
+            Assert(json.IndexOf("\"autoStopOnSilence\": true") >= 0, "静音自动停止开关应写入配置");
+            Assert(json.IndexOf("\"autoStopSilenceMs\": 900") >= 0, "静音时长应写入配置");
+
+            Config back = ConfigStore.LoadFromJson(json, new FakeProtector());
+            Assert(back.AutoStopOnSilence, "静音自动停止开关应能读回");
+            Assert(back.AutoStopSilenceMs == 900, "静音时长应能读回");
+
+            // 旧配置没有这两个字段。若缺字段时落到 0，会被校验器判为非法，
+            // 等于把还在用旧配置的用户直接锁在设置窗口外，所以必须回退到默认值。
+            Config legacy = ConfigStore.LoadFromJson("{\"apiKeyProtected\":\"ENC(k)\"}", new FakeProtector());
+            Assert(!legacy.AutoStopOnSilence && legacy.AutoStopSilenceMs == 1200,
+                "旧配置缺字段应回退到关闭与 1200ms，而不是 0");
         }
 
         private static void TestDiagnosticAudio()

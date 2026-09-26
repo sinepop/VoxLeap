@@ -15,6 +15,8 @@
   "enableVad": true,
   "vadThreshold": 450,
   "vadPaddingMs": 180,
+  "autoStopOnSilence": false,
+  "autoStopSilenceMs": 1200,
   "aiOrganize": false,
   "organizerBaseUrl": "",
   "organizerEndpoint": "/chat/completions",
