@@ -202,6 +202,17 @@ namespace VoxLeap
                 if (session != null && object.ReferenceEquals(session.CurrentRequest, request))
                     session.CurrentRequest = null;
             }
+            // 整理失败以前是**完全静默**的：调用方看到 OrganizedText 为空就回落成原文，
+            // 日志里只留下"整理=3xxxms"，看不出整理其实没生效，用户以为只是慢。
+            // 实机证据：连续 8 次会话里"识别字数"与"写入字数"完全相同——整理只要真的加过
+            // 标点或删过语气词，字数几乎不可能每次都不变。必须留痕，不许静默回落。
+            if (cfg.AiOrganize)
+            {
+                Log.Write("整理结果: ok=" + result.Ok
+                    + " 整理后=" + (result.Text == null ? 0 : result.Text.Length) + "字"
+                    + " 原文=" + original.Length + "字"
+                    + (string.IsNullOrEmpty(result.Error) ? "" : " 错误=" + result.Error));
+            }
             return result;
         }
 
